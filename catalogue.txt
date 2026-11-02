@@ -76,7 +76,7 @@
 - kill_unresponsive_process(target(text)): Force terminate a frozen, hung, or specific application process.
 - network_status(no args): Check internet connectivity, ping latency, local IP address, and active network adapters.
 - current_time(no args): Show the current system date, time, timezone, and day of week.
-- find_files(search_term(text)): Search for files by name pattern on the user's common folders (Desktop, Documents, Downloads).
+- find_files(search_term(text)): Find files AND folders by name with Everything (es.exe) across all indexed drives. Only backend; case-insensitive; folder matches marked [folder]; never walks user folders or Windows Search.
 - open_folder(folder(text)): Open a folder in File Explorer: a system folder (Downloads, Documents, Desktop, Pictures, Music, Videos, Home) or any named folder/absolute path (e.g. 'codee').
 - volume_set_level(level(text)): Set the system master volume to a specific percentage (0-100).
 - screen_brightness(action(enum)): Adjust screen brightness up, down, or to a specific percentage level.

@@ -192,7 +192,10 @@ def execute_skill_script_tool(tool_name: str, args: dict[str, Any]) -> dict[str,
     try:
         proc = subprocess.run(
             command,
-            cwd=str(repo_root),
+            # Run from the user profile, never the app/source tree: any relative
+            # path a skill script receives must not create deliverables inside
+            # the WinBrow project. Imports still resolve through PYTHONPATH.
+            cwd=str(Path.home()),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -246,10 +249,10 @@ def get_skill_script_tools() -> list[Tool]:
                     ),
                 ),
                 ArgSpec(
-                    name="spec", kind="text",
+                    name="spec", kind="json",
                     instructions=(
                         "JSON object with the operation and arguments named in "
-                        "SKILL DETAIL."
+                        "SKILL DETAIL. Pass an object, not a JSON-encoded string."
                     ),
                     default="{}",
                 ),

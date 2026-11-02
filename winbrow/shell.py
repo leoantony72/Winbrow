@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -32,6 +33,7 @@ SHELL_IMPL = "shell"
 
 _MARKER = "__WINBROW_EXIT__:"
 _MAX_TIMEOUT_S = 120
+_HEADLESS_PDF_RE = re.compile(r"--print-to-pdf\b", re.IGNORECASE)
 # Windows' -Command limit is 32,767 chars, and the wrapper adds quoting.
 # Keep 12k inline; write a .ps1 between 12k and 30k; reject above 30k with an
 # actionable message (create_text_file handles 200k if the user really needs it).
@@ -152,6 +154,20 @@ async def execute_shell_tool(tool_name: str, args: dict) -> dict[str, Any]:
                 f"Command too long ({len(command)} chars; max "
                 f"{_MAX_COMMAND_CHARS}). Write the script with "
                 "create_text_file, then run that file instead."
+            ),
+        }
+    if _HEADLESS_PDF_RE.search(command):
+        return {
+            "success": False,
+            "output": (
+                "Headless browser PDF export is not allowed through "
+                "run_command. Use run_skill_script(skill=\"html-ppt\", "
+                "script=\"render_deck.py\", spec={\"input\": ..., "
+                "\"format\": \"pdf\"}) for decks, or "
+                "run_skill_script(skill=\"pdf\", script=\"pdf_tool.py\", "
+                "spec={\"operation\": \"from_html\", ...}) for HTML pages. "
+                "Those helpers handle Chrome/Edge flags, file URIs, repair, "
+                "timing, and validation."
             ),
         }
     try:

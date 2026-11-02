@@ -227,11 +227,50 @@ def _parse_ddg_lite(html: str, limit: int) -> list[dict[str, str]]:
     return results
 
 
+FRESHNESS_ALIASES = {
+    "today": "day",
+    "24h": "day",
+    "24 hours": "day",
+    "1 day": "day",
+    "past day": "day",
+    "last day": "day",
+    "this week": "week",
+    "7d": "week",
+    "7 days": "week",
+    "past week": "week",
+    "last week": "week",
+    "recent": "week",
+    "latest": "week",
+    "this month": "month",
+    "30d": "month",
+    "30 days": "month",
+    "past month": "month",
+    "last month": "month",
+    "any": "",
+    "all": "",
+    "none": "",
+    "off": "",
+    "no filter": "",
+}
+
+
+def canonical_freshness(value: Any) -> str:
+    """Map a planner-friendly recency word to day/week/month without guessing."""
+    raw = str(value or "").strip().lower()
+    return FRESHNESS_ALIASES.get(raw, raw)
+
+
+def normalize_freshness(value: Any) -> str:
+    """Return a valid DuckDuckGo freshness code or '' when no filter applies."""
+    canonical = canonical_freshness(value)
+    return canonical if canonical in {"day", "week", "month"} else ""
+
+
 def _search(
     query: str, count: int, freshness: str,
 ) -> tuple[bool, str, list[dict[str, str]], dict[str, str]]:
     params = {"q": query}
-    freshness = (freshness or "").strip().lower()
+    freshness = normalize_freshness(freshness)
     if freshness in {"day", "week", "month"}:
         params["df"] = {"day": "d", "week": "w", "month": "m"}[freshness]
     errors: list[str] = []

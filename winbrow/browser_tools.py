@@ -288,6 +288,7 @@ def get_browser_tools():
                     name="instruction",
                     kind="text",
                     instructions="What to do on the current page, e.g. 'click the Python language filter'",
+                    default="",
                 ),
                 ArgSpec(
                     name="selector", kind="text",

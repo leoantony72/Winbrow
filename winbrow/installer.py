@@ -223,24 +223,54 @@ async def direct_download_install(url: str, silent_args: str = "",
 # --------------------------------------------------------------------------- registry ops (impl=installer)
 
 INSTALLER_IMPL = "installer"
+PACKAGE_ARG_ALIASES = (
+    "app",
+    "app_name",
+    "app_id",
+    "application",
+    "name",
+    "package_name",
+    "package_id",
+    "winget_id",
+    "query",
+    "id",
+    "software",
+    "program",
+)
+
+
+def package_from_args(args: dict) -> str:
+    """Read the package name, accepting the aliases planners commonly emit."""
+    args = args or {}
+    for key in ("package",) + PACKAGE_ARG_ALIASES:
+        value = args.get(key)
+        if (
+            isinstance(value, (list, tuple))
+            and len(value) == 1
+            and isinstance(value[0], (str, int, float))
+        ):
+            value = value[0]
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+    return ""
 
 
 async def op_search(args: dict) -> dict:
-    q = str(args.get("package", "")).strip()
+    q = package_from_args(args)
     if not q:
         return {"success": False, "output": "Missing 'package' to search"}
     return await winget_search(q)
 
 
 async def op_install(args: dict) -> dict:
-    pkg = str(args.get("package", "")).strip()
+    pkg = package_from_args(args)
     if not pkg:
         return {"success": False, "output": "Missing 'package'"}
     return await winget_install(pkg)
 
 
 async def op_uninstall(args: dict) -> dict:
-    pkg = str(args.get("package", "")).strip()
+    pkg = package_from_args(args)
     if not pkg:
         return {"success": False, "output": "Missing 'package'"}
     return await winget_uninstall(pkg)

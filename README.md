@@ -342,7 +342,7 @@ Additional rules:
 | `start.bat` | Windows launcher. Frees port `8765` from a previous detached server, then starts Uvicorn with reload on `.` and `winbrow`. |
 | `winbrow/__main__.py` | Enables `python -m winbrow <command>`. |
 | `winbrow/cli.py` | Developer CLI, including `python -m winbrow observe` for a UIA tree/context dump. |
-| `templates/index.html` | Single-page UI: hero, quick actions, live execution trace, proactive suggestions, command bar with microphone, and modals for Tools, Integrations, Subagents, and Settings. |
+| `templates/index.html` | Single-page UI: hero, quick actions, live execution trace, proactive suggestions, command bar with microphone, and modals for Tools, Integrations, Passwords, Subagents, and Settings. |
 | `static/` | Reserved static asset directory. Currently empty. |
 | `requirements.txt` | Core Python dependencies. |
 | `.env.example` | Documented configuration template. Copy to `.env`. |
@@ -393,7 +393,9 @@ Additional rules:
 
 | Module | Description |
 |---|---|
-| `winbrow/brain/agent_loop.py` | **AgentBrain**: closed-loop planner. Builds messages, calls the model gateway with a JSON schema, parses `action`, `done`, `chat`, or `clarify`, executes one step at a time, injects skill detail, tracks history, detects stuck loops, checks completion gaps, and stops at the action budget. |
+| `winbrow/brain/agent_loop.py` | **AgentBrain**: closed-loop planner. Builds messages, calls the model gateway with a JSON schema, parses `action`, `done`, `chat`, or `clarify`, preflights and executes one step or a bounded ordered batch, injects skill detail, tracks history, detects stuck loops, checks completion gaps, records batch outcomes, and stops at the action budget. Permission continuations resume only the unexecuted suffix. |
+| `winbrow/brain/batching.py` | Backend-owned batch contracts. Immutable `BatchPolicy` records decide ordered/parallel eligibility, shared resources and barriers; `validate_steps()` validates the whole proposal (args/defaults/enums, scope, duplicates, budget, JSON safety) before any side effect. Unknown/learned/script/MCP tools are singletons. |
+| `winbrow/execution.py` | Re-entrant `ContextVar` lease that serialises top-level goals and direct browser actions over shared UI state; awaited children/subagents inherit ownership. |
 | `winbrow/brain/model_gateway.py` | **Provider-agnostic LLM gateway.** Provider chain: Nebius Token Factory → OpenRouter → OpenAI → local. Handles OpenAI-compatible chat calls, retries, reasoning-token policy, empty-content recovery, JSON extraction and repair, and `GatewayUnavailable`. |
 | `winbrow/brain/prompt.py` | Static system prompt, planner JSON schema, model-specific prompt variants, skill metadata injection, and `SKILL DETAIL` injection. |
 | `winbrow/brain/prompts.py` | Compatibility shim for the legacy prompt module name. |
@@ -570,8 +572,8 @@ There are **three separate systems** that share the word “skill” but not sto
 **Skill inventory**
 
 - **27 tool skills**, including 3 generated learned-tool wrappers.
-- **46 playbook skills** under `winbrow/skills/library/`.
-- **73 total `SKILL.md` files.**
+- **54 playbook skills** under `winbrow/skills/library/`.
+- **81 total `SKILL.md` files.**
 
 **Playbook sections**
 
@@ -643,9 +645,11 @@ python -m winbrow.voice
 | **T3 confirmations** | Never remembered |
 | **Pending TTL** | 900 seconds, pruned on new pending requests |
 | **Secrets** | Stored in `data/integrations.json`, DPAPI-encrypted where available, masked on every read; environment variables take precedence |
+| **Browser passwords** | Imported only from a user-exported Chromium CSV through the Passwords modal; selected rows are DPAPI-encrypted in `data/browser_credentials.json`, and REST responses never return passwords |
 | **MCP** | Filesystem server sandboxed to the user profile; git defaults to this repository |
 | **Skill scripts** | Allowlisted library paths only; traversal, symlinks, oversized specs, and timeouts rejected |
 | **Subagents** | Child planners still call the parent `run_skill()` gate; browser and write profiles are sequential |
+| **Batching** | Only reviewed `BatchPolicy` tools may join a multi-action batch; every member passes `run_skill()`, mutations stay ordered, desktop batches replan as singles, and approval resumes only the unexecuted suffix |
 
 > `policy.py` is a regex safety net, not a sandbox. Generated scripts run with `-ExecutionPolicy Bypass`. Treat policy gaps as real risk.
 
@@ -719,6 +723,7 @@ Gated skills must call `integration_status` first and return a `clarify` step wi
 | `data/observe/` | VLM budget and dismissed suggestions |
 | `data/subagents.json` | Last 50 subagent runs |
 | `data/integrations.json` | Encrypted/masked integration secrets |
+| `data/browser_credentials.json` | DPAPI-encrypted browser logins imported from a user-exported CSV |
 | `logs/trace.jsonl` | Stage and command trace |
 | `models/qwen/`, `models/whisper/` | Local model files |
 | `llama_cpp/` | Local llama.cpp runtime |
@@ -842,7 +847,7 @@ desktop_agent/
 │   │   └── validate.py           Output validation
 │   ├── utils/
 │   │   └── history.py            History inspection and compression
-│   ├── skills/                   27 tool skills + 46 playbooks
+│   ├── skills/                   27 tool skills + 54 playbooks
 │   │   ├── <skill>/SKILL.md
 │   │   └── library/<section>/<skill>/SKILL.md
 │   └── tests/                    Focused module tests
@@ -872,6 +877,12 @@ For contributors, `AGENT.md` is the entry map. It points to `.agent/knowledge/` 
 - Optional: **Tesseract OCR** for better `screen_read_text` accuracy
 - Optional: **Ollama** or **LM Studio** for local routing/generation
 - Optional: **Chrome/Edge** for headless HTML-to-PDF rendering
+- Optional: **Everything** (`es.exe`) for instant full-drive filename search.
+  On first app start WinBrow auto-downloads the signed portable x64 build into
+  `%LOCALAPPDATA%\WinBrow\Everything`, verifies SHA-256 + Authenticode, and
+  starts a private `WinBrow` instance; set `WINBROW_EVERYTHING_AUTOINSTALL=0`
+  to disable. The first full-drive folder index can take a few minutes; while it
+  builds, `find_files` reports that the index is not ready yet.
 
 ### 1. Install dependencies
 
@@ -898,6 +909,12 @@ npm start          # or: npm run dev:electron for hot reload
 Until the packaged build lands, the machine needs Python for the sidecar.
 Quit from the tray icon; closing the dashboard leaves the island running. The
 app can also start at login (tray → "Start at login").
+
+The dashboard has **Chats**, **Server** and **Settings** tabs. Settings edits
+the same `.env` the sidecar loads, masks existing secrets, and offers a restart
+button for variables that are only read at startup. Deleted chats are hidden
+locally until the sidecar confirms the server-side delete, so they do not
+reappear after a restart.
 
 The island is a click-through, near-opaque idle pill (196×36). The main process
 hit-tests the cursor against its bounds: outside, clicks pass to the app
@@ -1006,6 +1023,10 @@ If Chrome asks for remote-debugging permission, open `chrome://inspect/#remote-d
 ## 9. Configuration
 
 All settings are environment variables, loaded from `.env` by `server.py`.
+The desktop dashboard's **Settings** tab edits the same file in place, masks
+existing secrets, applies call-time values to the running sidecar, and marks
+startup-only variables for a restart. A custom key/value row can add any other
+variable.
 
 ### Brain and providers
 
@@ -1036,6 +1057,7 @@ All settings are environment variables, loaded from `.env` by `server.py`.
 |---|---|---|
 | `WINBROW_BRAIN_FIRST` | `1` | Every request tries the brain before legacy fallbacks |
 | `WINBROW_MAX_STEPS` | `20` | Brain action budget |
+| `WINBROW_MAX_ACTIONS_PER_TURN` | `5` | Max actions in one planner `steps[]`; clamped to 1–10 and rejected whole when exceeded |
 | `WINBROW_STEP_TIMEOUT` | `120` | Per-action timeout in seconds |
 | `WINBROW_STEP_WARN` | `5` | Steps-remaining warning threshold |
 | `WINBROW_REASONING_MAX_TOKENS` | `2000` | Reasoning cap for structured calls |
@@ -1048,7 +1070,7 @@ All settings are environment variables, loaded from `.env` by `server.py`.
 | `WINBROW_HISTORY_MAX_CHARS` | `240000` interim | Hard history char budget (overrides the formula) |
 | `WINBROW_HISTORY_FULL` | `0` | Full-fidelity history (one entry per step) |
 | `WINBROW_HISTORY_BROWSER_FIRST` | `1` | Evict stale browser snapshots first |
-| `WINBROW_PARALLEL_READS` | `0` | Run 2-3 read-only calls concurrently |
+| `WINBROW_PARALLEL_READS` | `0` | Run reviewed independent read-only calls concurrently; separate from general batch eligibility |
 | `WINBROW_NOVELTY_NUDGE` | `1` | One advisory nudge after 5 steps with no new URL/path |
 | `WINBROW_RESULTS_DIR` | `logs/results` | Full copies of clipped tool output |
 | `WINBROW_SCRIPTS_DIR` | `logs/scripts` | Temp `.ps1` files for long commands |
@@ -1089,6 +1111,9 @@ All settings are environment variables, loaded from `.env` by `server.py`.
 | `WINBROW_SUBAGENT_HISTORY` | `data/subagents.json` | Subagent run history |
 | `WINBROW_SKILL_WRITER` | `1` | Enable automatic `SKILL.md` generation |
 | `WINBROW_SKILLS_DIR` | `tools` | Override replay-skill storage |
+| `WINBROW_EVERYTHING_AUTOINSTALL` | `1` | Download/start the portable Everything + ES index on first app launch |
+| `WINBROW_EVERYTHING_DIR` | `%LOCALAPPDATA%\WinBrow\Everything` | Override the portable Everything install folder |
+| `WINBROW_EVERYTHING_FOLDERS` | fixed drives | Override the folder-index list for a portable/test instance |
 
 > Never set `WINBROW_BYPASS_CONFIRM=1` in tests that assert safety behavior.
 
@@ -1119,11 +1144,19 @@ All settings are environment variables, loaded from `.env` by `server.py`.
 | `POST` | `/api/suggestions/dismiss` | Dismiss a suggestion for 12 hours |
 | `GET` | `/api/settings` | Current runtime LLM settings |
 | `POST` | `/api/settings` | Update provider, key, endpoint, and project ID |
+| `GET` | `/api/env` | Grouped `.env` settings with secrets masked |
+| `POST` | `/api/env` | Merge `updates`/`unset` into `.env` and apply them live |
 | `GET` | `/api/integrations` | Masked integration status and dependency status |
 | `POST` | `/api/integrations/{provider}` | Save integration values |
 | `POST` | `/api/integrations/{provider}/test` | Test an integration |
 | `DELETE` | `/api/integrations/{provider}` | Remove an integration |
 | `POST` | `/api/integrations/google/oauth` | Run the Google Workspace OAuth flow |
+| `GET` | `/api/browser-credentials` | List imported browser logins (no passwords) |
+| `POST` | `/api/browser-credentials/preview` | Parse a user-exported Chromium CSV; metadata only |
+| `POST` | `/api/browser-credentials/import` | Encrypt and store only the selected CSV rows |
+| `POST` | `/api/browser-credentials/import/cancel` | Discard a pending CSV import |
+| `DELETE` | `/api/browser-credentials/{id}` | Remove one imported login |
+| `DELETE` | `/api/browser-credentials` | Remove every imported browser login |
 | `GET` | `/api/subagents` | Subagent profile catalog and recent runs |
 | `POST` | `/api/browser` | Direct browser control |
 | `WS` | `/ws` | Live events, progress, and execution broadcasts |
@@ -1162,7 +1195,7 @@ curl.exe -X POST http://127.0.0.1:8765/api/confirm `
 | `clean temp files` | Removes temporary cache files | Built-in tool |
 | `what time is it in Tokyo` | World clock lookup | MCP / tool |
 | `open downloads folder` | Opens Downloads in Explorer | Built-in tool |
-| `find files named report` | Searches common user folders | Built-in tool |
+| `find files named report` | Everything `es.exe` drive-wide index, files and folders (only backend) | Built-in tool |
 | `take a screenshot` | Saves a screenshot | Built-in tool |
 | `take screenshot to clipboard` | Copies a screenshot | Built-in tool |
 | `type Hello World` | Types into the focused field | Built-in tool |
@@ -1268,6 +1301,7 @@ These are intentional and should not be “fixed” without understanding the tr
 10. **A new tool needs all of:** a `Tool`/`ArgSpec` definition, a permission tier, a `run_skill` dispatch branch, and a matching `SKILL.md` if the planner should see it.
 11. **PowerShell quoting is the most common bug source.** Single-quote and escape embedded apostrophes; never interpolate user text into a double-quoted PowerShell string.
 12. **Tests do not cover live CDP, UIA, or COM.** Verify those paths manually.
+13. **Batch eligibility is backend-owned.** Only reviewed `BatchPolicy` records may join a `steps[]` batch; every member still passes `run_skill()`, UI mutations stay ordered, and approval resumes only the unexecuted suffix rather than replaying the goal.
 
 **Adding a tool**
 

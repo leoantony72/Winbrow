@@ -104,7 +104,10 @@ def _resolve_slide_images(slides: list, output: Path, spec: dict) -> None:
 
 
 def create(spec: dict) -> None:
-    output = resolve_path(spec.get("output_path") or spec.get("path") or "")
+    output = resolve_path(
+        spec.get("output_path") or spec.get("path") or "",
+        default_dir=Path.home() / "Desktop",
+    )
     if output.suffix.lower() != ".pptx":
         output = output.with_suffix(".pptx")
     ensure_parent(output)
@@ -303,7 +306,10 @@ def find_image_op(spec: dict) -> None:
     query = str(spec.get("query") or "").strip()
     if not query:
         fail("A search 'query' is required.")
-    output_dir = resolve_path(spec.get("output_dir") or (Path.cwd() / "images"))
+    output_dir = resolve_path(
+        spec.get("output_dir")
+        or (Path.home() / "Pictures" / "WinBrow Images")
+    )
     try:
         count = max(1, min(int(spec.get("count") or 3), 8))
     except (TypeError, ValueError):

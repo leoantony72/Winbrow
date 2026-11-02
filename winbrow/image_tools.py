@@ -77,8 +77,6 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 NATIVE_FORMATS = ("JPEG", "PNG", "WEBP", "BMP", "GIF")
 WALLPAPER_FORMATS = ("JPEG", "PNG")
 
-FOLDER_NAMES = ("pictures", "downloads", "desktop", "documents")
-
 _QUERY_FILLER = frozenset({
     "image", "images", "img", "imgs", "picture", "pictures", "pic", "pics",
     "photo", "photos", "photograph", "photographs", "wallpaper", "wallpapers",
@@ -213,27 +211,34 @@ def unique_path(folder: Path, stem: str, suffix: str) -> Path:
 
 
 def resolve_folder(name: str = "", *, subfolder: str = "WinBrow Images") -> Path:
-    """Desktop/Downloads/Pictures/Documents (or a real path) -> directory.
+    """Desktop/Downloads/Pictures/Documents (or any real path) -> directory.
 
-    ``WINBROW_IMAGE_DIR`` overrides every friendly alias with one exact folder;
-    an explicit path argument always wins over both.
+    ``WINBROW_IMAGE_DIR`` overrides the friendly aliases with one exact folder;
+    an explicit path argument always wins over both. Only Windows system
+    folders are refused.
     """
+    from . import files
+    from .safe_paths import (
+        explicit_path,
+        remap_project_user_folder,
+        write_refusal,
+    )
+
     raw = str(name or "").strip()
     override = os.environ.get("WINBROW_IMAGE_DIR", "").strip()
-    if raw and re.match(r"^([A-Za-z]:[\\/]|~|\\\\)", raw):
-        folder = Path(os.path.expandvars(os.path.expanduser(raw)))
+    direct = explicit_path(raw)
+    if direct is not None:
+        folder = remap_project_user_folder(direct)
     elif override:
         folder = Path(os.path.expandvars(os.path.expanduser(override)))
     else:
-        from . import files
-
+        folder = files.resolve_user_folder(raw or "Pictures", "Pictures")
         key = (raw.lower().rstrip(":") or "pictures")
-        base = files._special_folder(key if key in FOLDER_NAMES else "pictures")
-        if not base:
-            base = os.path.join(files.user_home(), "Pictures")
-        folder = Path(base)
-        if key not in FOLDER_NAMES or key == "pictures":
+        if key in {"pictures", "picture", "images"}:
             folder = folder / subfolder
+    refusal = write_refusal(folder)
+    if refusal:
+        raise ImageToolError(refusal)
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 
@@ -640,6 +645,11 @@ def download_image(
         raise ImageToolError(f"Not an http(s) image URL: {url}")
     target_dir = (Path(folder) if isinstance(folder, Path)
                   else resolve_folder(str(folder or "")))
+    from .safe_paths import write_refusal
+
+    refusal = write_refusal(target_dir)
+    if refusal:
+        raise ImageToolError(refusal)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     response = http_get(
@@ -826,8 +836,9 @@ def get_image_tools() -> list[Tool]:
                 "Searches general web photos first (DuckDuckGo/Bing), then "
                 "licensed Wikimedia photos; uses Wallhaven/NekosAPI only for "
                 "art, anime, or wallpaper requests. Validates each file with "
-                "Pillow and saves it into Pictures\\WinBrow Images or the folder "
-                "the user asked for. No browser is opened. Use this for "
+                "Pillow and saves it into Pictures\\WinBrow Images, a friendly "
+                "folder, or any absolute folder path the user named. Windows "
+                "system folders are refused. No browser is opened. Use this for "
                 "standalone saved pictures instead of browser_navigate, "
                 "web_search, or download_file. For images embedded in a "
                 "document, prefer the document skill's licensed image step."
@@ -848,14 +859,13 @@ def get_image_tools() -> list[Tool]:
                     default=str(DEFAULT_COUNT),
                 ),
                 ArgSpec(
-                    name="folder", kind="enum",
-                    instructions="Where to save the images.",
-                    criteria={
-                        "Pictures": "Pictures\\WinBrow Images (default)",
-                        "Downloads": "the Downloads folder",
-                        "Desktop": "the Desktop",
-                        "Documents": "the Documents library",
-                    },
+                    name="folder", kind="text",
+                    instructions=(
+                        "Where to save: Pictures (default), Downloads, Desktop, "
+                        "Documents, Videos, or any absolute folder path such as "
+                        "D:\\projects\\deck\\assets. Windows system folders are "
+                        "refused."
+                    ),
                     default="Pictures",
                 ),
                 ArgSpec(

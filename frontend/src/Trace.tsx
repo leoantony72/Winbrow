@@ -1,7 +1,7 @@
-import { useState } from "react";
 import type { TaskView } from "./types";
 import { argHint, elapsed, shortTime, skillVerb } from "./lib/format";
 import Markdown from "./lib/markdown";
+import CopyButton from "./components/CopyButton";
 
 interface TraceProps {
   task: TaskView;
@@ -31,6 +31,12 @@ function ThinkingBlock({
         <span className="chev">›</span>
         <span className="thinking-label">{label}</span>
         <span className="thinking-preview">{text.replace(/\s+/g, " ").slice(0, 110)}</span>
+        <CopyButton
+          text={text}
+          title={`Copy ${label}`}
+          className="answer-copy trace-copy"
+          stopPropagation
+        />
         <span className="trace-time">{shortTime(ts * 1000)}</span>
       </summary>
       <pre className="thinking-body">{text}</pre>
@@ -42,6 +48,14 @@ function StepCard({ step }: { step: TaskView["steps"][number] }) {
   const hint = argHint(step.args);
   const argsJson = JSON.stringify(step.args, null, 2);
   const hasBody = Boolean(step.output || step.warning || argsJson !== "{}");
+  const copyText = [
+    step.why ? `why: ${step.why}` : "",
+    argsJson !== "{}" ? `input:\n${argsJson}` : "",
+    step.output ? `output:\n${step.output}` : "",
+    step.warning ? `warning: ${step.warning}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
   return (
     <div className={`step step-${step.status}`}>
       <div className="step-head">
@@ -49,6 +63,13 @@ function StepCard({ step }: { step: TaskView["steps"][number] }) {
         <span className="step-skill">{step.skill}</span>
         {hint && <span className="step-hint">{hint}</span>}
         <span className="step-spacer" />
+        {copyText ? (
+          <CopyButton
+            text={copyText}
+            title={`Copy ${step.skill} details`}
+            className="answer-copy trace-copy"
+          />
+        ) : null}
         {step.elapsedMs ? (
           <span className="trace-time">{(step.elapsedMs / 1000).toFixed(1)}s</span>
         ) : null}
@@ -132,34 +153,7 @@ function ClarifyCard({
 }
 
 function AnswerCard({ task }: { task: TaskView }) {
-  const [copied, setCopied] = useState(false);
   const sources = sourceLinks(task.evidence);
-
-  const copy = async () => {
-    const text = task.answer || "";
-    const markCopied = () => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1400);
-    };
-    try {
-      await navigator.clipboard.writeText(text);
-      markCopied();
-    } catch {
-      // Fallback for contexts where the async clipboard is unavailable.
-      const area = document.createElement("textarea");
-      area.value = text;
-      area.style.position = "fixed";
-      area.style.opacity = "0";
-      document.body.appendChild(area);
-      area.select();
-      try {
-        if (document.execCommand("copy")) markCopied();
-      } catch {
-        // The text remains selectable by hand.
-      }
-      document.body.removeChild(area);
-    }
-  };
 
   return (
     <div className="answer">
@@ -167,9 +161,10 @@ function AnswerCard({ task }: { task: TaskView }) {
         <StatusDot status={task.live ? "running" : task.status} />
         <span>result</span>
         <span className="step-spacer" />
-        <button className="answer-copy" onClick={copy} title="Copy the full answer">
-          {copied ? "copied" : "copy"}
-        </button>
+        <CopyButton
+          text={task.answer || ""}
+          title="Copy the full answer"
+        />
         <span className="trace-time">{elapsed(task)}</span>
       </div>
       <div className="answer-body">
@@ -194,6 +189,10 @@ export default function Trace({ task, rawReasoning, onOption }: TraceProps) {
   const summaries = task.thinking.filter((b) => b.kind === "summary");
   const raws = rawReasoning ? task.thinking.filter((b) => b.kind === "raw") : [];
   const lastSummary = summaries[summaries.length - 1];
+  const showClarify =
+    task.needsInput &&
+    task.status !== "cancelled" &&
+    task.status !== "failed";
 
   return (
     <div className="trace">
@@ -215,13 +214,13 @@ export default function Trace({ task, rawReasoning, onOption }: TraceProps) {
 
       {task.error ? <div className="error-box">{task.error}</div> : null}
 
-      {task.needsInput ? (
+      {showClarify ? (
         <ClarifyCard task={task} onOption={onOption} />
       ) : task.answer ? (
         <AnswerCard task={task} />
       ) : null}
 
-      {!task.needsInput &&
+      {!showClarify &&
       !task.answer &&
       !task.steps.length &&
       !summaries.length &&

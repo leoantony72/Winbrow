@@ -58,7 +58,7 @@ trust the checkpoint and only verify the files named in "Next actions".
 | `02-browser-automation.md` | CDP backends, agent tab, page cache, browser tools, upload flow |
 | `03-skill-system.md` | `SKILL.md` format, progressive disclosure, skill writer, replay memory |
 | `04-request-data-flow.md` | End-to-end routing, permissions, dispatch, brain loop, history, memory |
-| `05-known-issues.md` | 58 verified bugs/risks with `file:line` and mitigations |
+| `05-known-issues.md` | 56 verified bugs/risks with `file:line` and mitigations |
 | `06-recent-changes-and-decisions.md` | Git state, uncommitted work, architectural decisions, refresh steps |
 
 ---
@@ -113,6 +113,12 @@ The following assumptions appear in some task templates but **do not exist in th
     apostrophes; never interpolate user text into a double-quoted PowerShell string.
 11. **Tests:** `pytest` files exist under `winbrow/tests/` and repo root. They do not cover live
     CDP/UIA. Record exactly what you ran.
+12. **Batch eligibility is backend-owned, not model-owned.** A `steps[]` plan is preflighted by
+    `winbrow/brain/batching.py` and each member still goes through `run_skill()`. Only reviewed
+    `BatchPolicy` records grant ordered/parallel eligibility; names, categories, tiers, learned/MCP
+    descriptions and a model `parallel` flag grant none. Mutations stay ordered, and desktop work
+    without a reviewed window guard replans as single actions. Approval resumes only the saved
+    unexecuted suffix (`agent.confirm_pending()` → `brain.resume_pending()`), never the whole goal.
 
 ## Fast orientation
 
@@ -120,7 +126,8 @@ The following assumptions appear in some task templates but **do not exist in th
 |---|---|
 | Where does a request enter? | `server.py` (`/api/execute`), `run.py`/`start.bat`, `winbrow/cli.py` |
 | What orchestrates a command? | `winbrow/agent.py` → `WinBrowAgent.execute()` (`:1033`) |
-| What plans multi-step work? | `winbrow/brain/agent_loop.py` → `AgentBrain.handle()` (`:543`) |
+| What plans multi-step work? | `winbrow/brain/agent_loop.py` → `AgentBrain.handle()` |
+| What decides batch eligibility? | `winbrow/brain/batching.py` (`BatchPolicy`, `validate_steps`) |
 | What talks to the LLM? | `winbrow/brain/model_gateway.py` |
 | What prompts the planner? | `winbrow/brain/prompt.py` (`SYSTEM_PROMPT_STATIC`, `build_loop_messages`) |
 | What routes one-shot commands? | `winbrow/router.py` → `WinBrowRouter.route()` (`:979`) |
@@ -135,6 +142,7 @@ The following assumptions appear in some task templates but **do not exist in th
 | How does web research avoid the browser? | `winbrow/web_tools.py` (`web_search`, `web_fetch`) |
 | Where are subagents? | `winbrow/subagents.py` (`delegate_task`, scoped child brains) |
 | Where are optional integrations? | `winbrow/integrations.py`, `templates/index.html` |
+| Where is the browser-password vault? | `winbrow/browser_credentials.py`, Passwords modal in `templates/index.html` |
 
 ## Repository map
 

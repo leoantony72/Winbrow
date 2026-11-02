@@ -289,7 +289,10 @@ def _blocks_from_spec(spec: dict, output: Path) -> tuple[list[dict], PdfTheme]:
 
 
 def create(spec: dict) -> None:
-    output = resolve_path(spec.get("output_path") or spec.get("path") or "")
+    output = resolve_path(
+        spec.get("output_path") or spec.get("path") or "",
+        default_dir=Path.home() / "Desktop",
+    )
     if output.suffix.lower() != ".pdf":
         output = output.with_suffix(".pdf")
     ensure_parent(output)
@@ -340,7 +343,10 @@ def merge(spec: dict) -> None:
     inputs = spec.get("inputs") or spec.get("input_paths") or []
     if not isinstance(inputs, list) or len(inputs) < 2:
         fail("Merge needs at least two input PDFs in 'inputs'.")
-    output = resolve_path(spec.get("output_path") or spec.get("path") or "")
+    output = resolve_path(
+        spec.get("output_path") or spec.get("path") or "",
+        default_dir=Path.home() / "Desktop",
+    )
     if output.suffix.lower() != ".pdf":
         output = output.with_suffix(".pdf")
     writer = PdfWriter()
@@ -379,7 +385,10 @@ def rotate(spec: dict) -> None:
     path = resolve_path(spec.get("path") or spec.get("input_path") or "")
     if not path.is_file():
         fail(f"PDF not found: {path}")
-    output = resolve_path(spec.get("output_path") or path)
+    output = resolve_path(
+        spec.get("output_path") or path,
+        default_dir=Path.home() / "Desktop",
+    )
     try:
         angle = int(spec.get("angle") or 90) % 360
     except (TypeError, ValueError):
@@ -420,7 +429,10 @@ def watermark(spec: dict) -> None:
     path = resolve_path(spec.get("path") or spec.get("input_path") or "")
     if not path.is_file():
         fail(f"PDF not found: {path}")
-    output = resolve_path(spec.get("output_path") or path)
+    output = resolve_path(
+        spec.get("output_path") or path,
+        default_dir=Path.home() / "Desktop",
+    )
     text = str(spec.get("text") or "CONFIDENTIAL")
     try:
         font_size = float(spec.get("font_size") or 48)
@@ -453,7 +465,10 @@ def encrypt(spec: dict) -> None:
     path = resolve_path(spec.get("path") or spec.get("input_path") or "")
     if not path.is_file():
         fail(f"PDF not found: {path}")
-    output = resolve_path(spec.get("output_path") or path)
+    output = resolve_path(
+        spec.get("output_path") or path,
+        default_dir=Path.home() / "Desktop",
+    )
     user_pw = str(spec.get("user_password") or "")
     owner_pw = str(spec.get("owner_password") or user_pw)
     if not user_pw:
@@ -630,7 +645,8 @@ def images(spec: dict) -> None:
     if not path.is_file():
         fail(f"PDF not found: {path}")
     output_dir = resolve_path(
-        spec.get("output_dir") or (path.parent / f"{path.stem}_images")
+        spec.get("output_dir") or (path.parent / f"{path.stem}_images"),
+        default_dir=Path.home() / "Desktop",
     )
     ensure_parent(output_dir / "placeholder")
     reader = _readable_reader(path)
@@ -665,7 +681,8 @@ def latex_op(spec: dict) -> None:
     if not source.strip():
         fail("Provide LaTeX source in 'content', 'latex', or 'content_path'.")
     output = resolve_path(
-        spec.get("output_path") or spec.get("path") or "document.pdf"
+        spec.get("output_path") or spec.get("path") or "document.pdf",
+        default_dir=Path.home() / "Desktop",
     )
     if output.suffix.lower() != ".pdf":
         output = output.with_suffix(".pdf")
@@ -766,7 +783,8 @@ def find_image_op(spec: dict) -> None:
     if not query:
         fail("A search 'query' is required.")
     output_dir = resolve_path(
-        spec.get("output_dir") or (Path.cwd() / "images")
+        spec.get("output_dir")
+        or (Path.home() / "Pictures" / "WinBrow Images")
     )
     try:
         count = max(1, min(int(spec.get("count") or 3), 8))

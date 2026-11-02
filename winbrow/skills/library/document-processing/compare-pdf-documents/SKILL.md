@@ -1,22 +1,15 @@
 ---
-name: "compare-pdf-documents"
-skill: "compare_pdf_documents"
-args:
-  - name: "file_paths"
-    type: "string"
-    required: true
-    default: null
-    description: "List of absolute paths to the PDF files to compare."
-  - name: "output_folder"
-    type: "string"
-    required: false
-    default: null
-    description: "Folder where the comparison summary file should be written. Defaults to the folder of the first file."
+name: compare-pdf-documents
+skill: playbook_compare_pdf_documents
+kind: playbook
+category: document-processing
+args: []
 description: >
-  Compare two or more PDF documents by extracting text and computing pairwise
-  similarity and differences. Use when the user asks to compare multiple PDFs
-  or find changes between document versions. Do not use for a single PDF, for
-  non-document files, or when only a summary of one document is needed.
+  Compare two or more PDF documents by extracting text and computing
+  pairwise similarity and differences. Use when the user asks to compare
+  multiple PDFs or find changes between document versions. Do not use for
+  a single PDF, for non-document files, or when only a summary of one
+  document is needed.
 ---
 
 ## When to Use

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from winbrow.skill_script_utils import (
     clip, emit, ensure_parent, fail, load_spec, require_module, resolve_path,
 )
@@ -31,7 +33,10 @@ def _write_rows(worksheet, rows) -> int:
 
 
 def create(spec: dict) -> None:
-    output = resolve_path(spec.get("output_path") or spec.get("path") or "")
+    output = resolve_path(
+        spec.get("output_path") or spec.get("path") or "",
+        default_dir=Path.home() / "Desktop",
+    )
     if output.suffix.lower() != ".xlsx":
         output = output.with_suffix(".xlsx")
     ensure_parent(output)

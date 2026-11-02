@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from winbrow.brain.agent_loop import AgentBrain, BrainStepResult
 from winbrow.brain.model_gateway import GatewayResponse
 from winbrow.memory.store import MemoryStore
+from winbrow.registry import ArgSpec, Tool
 
 
 class _Gateway:
@@ -30,6 +31,21 @@ class _Gateway:
 
 
 class _Registry:
+    def __init__(self):
+        self._tools = {}
+        for name, impl, arg_names in (
+            ("web_fetch", "web", ("url",)),
+            ("read_document", "document", ("path",)),
+            ("create_text_file", None, ("filename", "content")),
+        ):
+            self._tools[name] = Tool(
+                name=name,
+                description="Parallel-read test fixture",
+                script="",
+                impl=impl,
+                args=[ArgSpec(arg, "text", "", default="") for arg in arg_names],
+            )
+
     def available(self, ctx):
         return []
 
@@ -37,7 +53,7 @@ class _Registry:
         return []
 
     def get(self, name):
-        return object()
+        return self._tools.get(name)
 
 
 class _Ctx:
@@ -131,6 +147,9 @@ def test_failed_batch_still_records_remaining_reads(monkeypatch):
         "web_fetch", "read_document"]
     assert result.steps[0].success is False
     assert result.steps[1].success is True
+    # Both reads had already run concurrently; none is falsely reported queued.
+    assert result.batches[0]["attempted"] == 2
+    assert result.batches[0]["unexecuted"] == []
 
 
 def test_duplicate_reads_are_not_batched(monkeypatch):
@@ -149,5 +168,8 @@ def test_duplicate_reads_are_not_batched(monkeypatch):
         return BrainStepResult(skill, args, True, "ok")
 
     brain._run_step = fake_run
-    asyncio.run(brain.handle("read twice", _Ctx(), _Session()))
+    result = asyncio.run(brain.handle("read twice", _Ctx(), _Session()))
     assert len(calls) == 1
+    assert result.batches[0]["attempted"] == 1
+    assert result.batches[0]["stop_reason"] == "already_succeeded"
+    assert len(result.batches[0]["unexecuted"]) == 1

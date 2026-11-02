@@ -516,6 +516,13 @@ def _apply_guards(
         skill_key=_normalise_key(candidate.skill_key or candidate.name),
         description=_limit_words(candidate.description),
     )
+    # The writer captures reusable *workflows*, so the artifact is guidance,
+    # not a new atomic tool. Playbooks are the only guidance kind the registry
+    # accepts, and they require the playbook_ dispatcher prefix.
+    if candidate.skill_key and not candidate.skill_key.startswith("playbook_"):
+        candidate = replace(
+            candidate, skill_key=f"playbook_{candidate.skill_key}",
+        )
     if not _KEBAB_RE.match(candidate.name or ""):
         return replace(
             candidate, should_save=False,
@@ -697,6 +704,7 @@ def render_skill_md(candidate: SkillCandidate) -> str:
     return f"""---
 name: {_yaml_scalar(candidate.name)}
 skill: {_yaml_scalar(candidate.skill_key)}
+kind: playbook
 {_render_args_frontmatter(candidate.args)}
 description: >
 {_fold_yaml(description)}

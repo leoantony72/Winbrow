@@ -445,7 +445,7 @@ class TestFileWrites(unittest.TestCase):
         bad = write_named_text_file({"filename": "..\\escape.txt", "content": "x"},
                                     base_dir=tmp)
         self.assertFalse(bad["success"])
-        self.assertIn("path separators", bad["output"])
+        self.assertIn("Invalid filename", bad["output"])
 
 
 class TestBrowserTools(unittest.TestCase):

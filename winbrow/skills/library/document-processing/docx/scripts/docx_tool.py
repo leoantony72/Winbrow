@@ -189,7 +189,10 @@ def _find_paragraph(document, anchor: str):
 # ---------------------------------------------------------------------------
 
 def create(spec: dict) -> None:
-    output = resolve_path(spec.get("output_path") or spec.get("path") or "")
+    output = resolve_path(
+        spec.get("output_path") or spec.get("path") or "",
+        default_dir=Path.home() / "Desktop",
+    )
     if output.suffix.lower() != ".docx":
         output = output.with_suffix(".docx")
     ensure_parent(output)

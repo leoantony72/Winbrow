@@ -1,19 +1,29 @@
 ---
 knowledge: 06-recent-changes-and-decisions
-last_verified: 2026-10-25
+last_verified: 2026-11-01
 source_files:
   - .git
   - winbrow/brain/skill_writer.py
   - winbrow/brain/agent_loop.py
+  - winbrow/brain/batching.py
+  - winbrow/brain/prompt.py
+  - winbrow/execution.py
+  - winbrow/permissions.py
   - winbrow/brain/skill_registry.py
   - winbrow/brain/model_gateway.py
   - winbrow/skill_scripts.py
   - winbrow/integrations.py
+  - winbrow/browser_credentials.py
+  - winbrow/everything.py
+  - winbrow/shell.py
   - winbrow/subagents.py
   - winbrow/agent.py
   - server.py
   - templates/index.html
   - winbrow/tests/test_skill_writer.py
+  - winbrow/tests/test_find_files_tool.py
+  - tools/seed.json
+  - winbrow/skills/find-files/SKILL.md
   - tools/skills.json
   - winbrow/browser_task.py
   - winbrow/router.py
@@ -97,6 +107,9 @@ Known pre-existing unrelated failures at HEAD: router tests
 
 | Surface | Last meaningful change | Risk |
 |---|---|---|
+| Batch planner/executor + contracts | 2026-11-01 (section 20) | High; new execution path with test coverage |
+| Permission continuation / action keys | 2026-11-01 (section 20) | High; old `v2:` grants intentionally invalidated |
+| Browser batch guard (`batch_state`) | 2026-11-01 (section 20) | Medium; mocked CDP tests only |
 | Browser page-state cache / readiness | 2026-10-25 (this session) | Medium; see "Browser task regression fixes" below |
 | Browser app preference (`set_preferred_browser`) | 2026-10-25 (this session) | Medium; Chrome/Edge/Brave routing |
 | Browser upload/tab/click | 2026-10-22 (`b82cfb2`, `348b213`) | **Highest**; actively churning |
@@ -110,7 +123,7 @@ Known pre-existing unrelated failures at HEAD: router tests
 | `accessibility.py` | 2026-10-05 | Dead code |
 | `vision.py` | Older, unreferenced | Dead/broken |
 
-## 3. Documented decisions (12)
+## 3. Documented decisions (13)
 
 D1. **Raw CDP over a browser framework.** Avoid Playwright/pydoll/Selenium; keep the user's real
 browser and logins. Accept hand-rolled transport complexity.
@@ -152,6 +165,15 @@ consumes `max_tokens`; Nebius maps the shared policy to `reasoning_effort`.
 
 D12. **Windows-native execution.** PowerShell + COM + UIA + ctypes, with app adapters rather than a
 generic GUI framework. `policy.py` is a safety net, not a sandbox.
+
+D13. **Backend-owned batch contracts, sequential by default.** The planner may emit a bounded
+`steps[]`, but a reviewed `BatchPolicy` (not a model flag, name prefix, permission tier or
+external description) decides ordered/parallel eligibility and barriers. Mutations stay
+ordered; only reviewed independent reads may run concurrently via the separate
+`WINBROW_PARALLEL_READS` flag. Every member still goes through `run_skill()`. Exact approval
+continuation resumes the unexecuted suffix under a shared execution lease; it never restarts
+the goal or re-spends an approval. Unknown capabilities fall back to singletons/observation
+barriers until reviewed. See `BRAIN_BATCHING_PLAN.md` and section 20.
 
 ## 4. What changed most recently and why it matters
 
@@ -461,10 +483,10 @@ dependency):
   `scaffold_skill.py` and `validate_skill.py` for WinBrow frontmatter, script
   contract, trigger descriptions, and category rules.
 
-Registry: 46 playbooks + 27 tool skills. `validate_skill.py --all` reports 0
-errors across 73 skills. Tests: `winbrow/tests/test_anthropic_skills.py` covers
-registry wiring, validation, and live helper calls for docx/pdf/pptx/art/skill
-scaffolding.
+Registry: 54 playbooks + 27 tool skills. `validate_skill.py --spec-json
+'{"all": true}'` reports 0 errors across 81 skills. Tests:
+`winbrow/tests/test_anthropic_skills.py` covers registry wiring, validation,
+and live helper calls for docx/pdf/pptx/art/skill scaffolding.
 
 ## 17. HTML PPT Studio integrated (2026-10-27)
 
@@ -534,3 +556,202 @@ Tests: `test_pdf_layout.py`, `test_pptx_layout.py`, and
 `test_image_search.py` cover dense pages, 70-row tables, landscape Letter,
 long URLs, images, 16:9/4:3, continuation slides, native charts, geometry
 validation, and local/live image search.
+
+## 20. General-purpose guarded batching (2026-11-01)
+
+Implemented the Phases 0–2 first slice from `BRAIN_BATCHING_PLAN.md`. The planner can
+now emit one bounded heterogeneous `steps[]` group; the backend decides eligibility and
+the executor verifies or stops between members.
+
+- `winbrow/brain/batching.py` adds immutable, reviewed `BatchPolicy` records keyed by
+  exact tool name plus dispatcher impl, a live `WINBROW_MAX_ACTIONS_PER_TURN` cap
+  (default 5, clamp 1–10), and all-or-nothing `validate_steps()` preflight. Names,
+  categories, tiers, learned/MCP descriptions and model `parallel` flags grant no
+  eligibility.
+- `winbrow/brain/prompt.py` makes `steps[]` first-class, bounds it in the schema,
+  states the mixed known-input/read-after-write rules, and replaces the contradictory
+  one-action/read-only prompt text. Every ordered tool's contract/full guidance is in
+  the BATCH TOOL CONTRACTS system block, not first-member-only detail.
+- `winbrow/brain/agent_loop.py` executes validated members sequentially through
+  `run_skill()`, keeps per-member budget/history/events, records `BrainResult.batches`
+  with planned/attempted/unexecuted/stop_reason, stops at policy/verification barriers,
+  and saves an exact continuation cursor on permission-required. `resume_pending()`
+  revalidates and runs only the unexecuted suffix.
+- `winbrow/execution.py` adds a re-entrant ContextVar lease that serialises top-level
+  goals while letting awaited children/subagents inherit ownership. `execute()`,
+  `confirm_pending()` and direct `/api/browser` actions hold it; a pending
+  approval releases it while waiting.
+- `winbrow/browser_task.py` adds `batch_state()`: remembered agent tab + per-document
+  token + selector signatures without mutable values. `WinBrowAgent._guard_batch()`
+  revalidates document identity and one connected/visible/enabled target before the
+  batch and after each successful member. Desktop has no reviewed window guard yet, so
+  desktop batches replan as single actions.
+- `winbrow/permissions.py` adds request scoping, full case-sensitive `v2:` action keys,
+  atomic consume-before-dispatch, exact ID/session/args matching, TTL pruning on lookup,
+  and one-shot T3. `POST /api/confirm`, WebSocket confirm and chat yes/no all use the
+  same continuation path.
+- Browser checkboxes, desired-state primitives, reviewed desktop window guards, result
+  bindings, MCP/API contracts and live performance measurement remain Phase 3+ barriers,
+  not hidden batch eligibility.
+
+Verification: `python -m pytest winbrow/tests -q` → 598 passed, 2 skipped;
+`test_brain_m0.py` → 50 passed; focused batch/policy/guard/permission tests → 309
+passed. No live model, CDP or UIA run. Unrelated root suites still have
+environment-dependent failures at HEAD when `.env` supplies a live provider.
+
+## 21. Consent-based browser password import (2026-11-01)
+
+`winbrow/browser_credentials.py` adds a local vault for logins the user exports
+from a Chromium browser’s own password manager. It deliberately does **not** read
+`Login Data`, decrypt a browser profile, or accept a browser database path.
+
+- `preview_browser_csv()` accepts only the user-selected CSV, validates
+  `http(s)` origins, deduplicates by origin + username, and returns metadata
+  (`origin`, `username`, `name`, `source`) without passwords. Pending plaintext
+  lives only in process memory for 10 minutes.
+- `commit_browser_import()` stores only the explicitly selected row IDs. Each
+  password is encrypted with Windows DPAPI before `data/browser_credentials.json`
+  is written; the file is gitignored and gets a best-effort private ACL.
+- `GET /api/browser-credentials` and the import responses never serialize a
+  password. Delete/clear endpoints remove vault entries. The UI is the
+  **Passwords** modal in `templates/index.html`; the file picker is the only
+  browser-password input path.
+- `get_credential_for_origin()` is an internal broker helper for a future
+  login/fill action. It is intentionally not exposed through REST or a model
+  tool; no agent-facing credential-returning tool exists.
+- Tests: `winbrow/tests/test_browser_credentials.py` covers metadata-only
+  previews, DPAPI-at-rest, selected-row commits, re-import updates, invalid/
+  unsupported URLs, API masking, and the UI consent markers.
+
+This is **not** a cross-browser harvester. The user must export from the
+browser UI and choose the CSV; there is no silent profile read.
+
+## 22. PDF export performance guard (2026-11-02)
+
+Recent slow PDF runs were dominated by orchestration, not the PDF engine:
+
+- `run_command` was used for ad-hoc headless Edge/Chrome `--print-to-pdf`.
+  The first attempt failed after 33.5s; the retry needed another 26.3s. The
+  existing helpers (`html-ppt/render_deck.py`, `pdf/pdf_tool.py` `from_html`)
+  already use `--headless=new`, a temporary profile, `file://` URIs, repair,
+  timing, and validation.
+- `run_command` now rejects `--print-to-pdf` with an actionable message naming
+  both helper calls. The static planner prompt also forbids ad-hoc headless PDF
+  export and points at the helpers.
+- Measured on this machine: a 5-page PDF with 5 images plus validation took
+  **6.0s** through `pdf_tool.py create`; a five-slide HTML deck took **2.8s**
+  to render and **1.6s** to validate. The PDF writer is not the bottleneck.
+- Remaining slow paths are serial image downloads and one LLM planning turn per
+  step; these are not changed by this guard.
+
+Tests: `test_shell_caps.py` and `test_prompt_order.py` cover the guard and
+prompt routing; the PDF/deck suites pass.
+
+## 23. Fast indexed file search (2026-11-02)
+
+`find_files` uses the Everything index as its only search backend:
+
+1. **Everything CLI** (`es.exe`): case-insensitive filename search through the
+   portable WinBrow instance (or a standard Everything install). It returns
+   folders first (`/ad`), then files (`/a-d`), and marks folders as
+   `[folder] path`. The tool starts the portable instance itself if it is not
+   running.
+2. **No Windows Search and no scoped folder fallback.** The old
+   Desktop/Documents/Downloads/Pictures `Get-ChildItem` walk and the
+   `SYSTEMINDEX` query were both removed. If Everything is missing or still
+   building its first index, the tool reports that instead of returning partial
+   user-folder results.
+3. **No `-i` flag.** In ES 1.1.0.38 `-i` means *match case*; passing it made
+   `kaithi` miss `KAITHI_2019_...mp4`. Case-insensitive is the default.
+4. **Folders are included.** The old `Test-Path -PathType Leaf` filter dropped
+   directory hits, so "find the pcc folder" missed `D:\Codee\pcc` and the
+   planner fell back to `run_command`/`list_directory`.
+5. **UTF-8 JSON export.** ES stdout is decoded with the console code page inside
+   the persistent PowerShell host; paths with non-ASCII characters (the NBSP in
+   `KAITHI_2019_Tamil Proper...`) became `\ufffd` and failed `Test-Path`. The
+   tool now runs `-export-json <tmp> -utf8-bom`, reads the file with UTF-8, and
+   parses it with `ConvertFrom-Json`.
+
+The persistent PowerShell host does not honor a top-level `return` as “stop
+the rest of this input”, so each later backend is guarded with
+`if ($results.Count -eq 0)` rather than early returns; the final result is one
+mutually exclusive `if/elseif/else`. The search term uses a single-quoted
+PowerShell string so `$()` is treated literally. The final output names the
+source that produced the hit. The skill and README describe the indexed search
+order and the unindexed-drive limitation.
+
+`app_search` remains the winget package search. It is not a local installed-app
+finder; `app_focus_or_launch` resolves from the cached local app catalog.
+
+## 24. Portable Everything auto-install (2026-11-02)
+
+`winbrow/everything.py` makes the `find_files` Everything fallback available
+without a manual install:
+
+- Checks `%LOCALAPPDATA%\WinBrow\Everything` for `es.exe` + `Everything.exe`.
+- If missing, downloads the official voidtools x64 archives pinned to
+  Everything 1.5.0.1424b and ES 1.1.0.38, verifies the published/observed
+  SHA-256 digests and both Authenticode signatures (`CN=voidtools PTY LTD`),
+  and extracts only `Everything.exe`, `Everything.lng`, and `es.exe`.
+- Starts a **private** Everything instance named `WinBrow` with `-startup` and
+  `-config` in the app folder. First start uses `-no-auto-index -folders`
+  for fixed drives (folder indexing works as a standard user; no service or
+  admin). Later starts reuse the saved config; `folders.txt` changes trigger a
+  folder-list update.
+- `server.py` runs this in a background task after PowerShell warm-up, so boot
+  is not blocked. Under pytest the side effect is skipped.
+- `find_files` prefers the app-local `es.exe` with `-instance WinBrow` and
+  `-timeout 5000`, then standard Everything installations, then the scoped
+  folder fallback.
+- Disable with `WINBROW_EVERYTHING_AUTOINSTALL=0`; override paths with
+  `WINBROW_EVERYTHING_DIR` / `WINBROW_EVERYTHING_FOLDERS`.
+
+Live smoke: a temporary install found a unique file through the app-local ES
+instance after Windows Search missed it. The production install also completed
+in `%LOCALAPPDATA%\WinBrow\Everything` and `find_files` found a `D:\` repo file
+through Everything after Windows Search missed it. The initial full-drive folder
+index can take minutes; ES returns partial results until it completes. After
+stop/restart the persisted `Everything-WinBrow.db` (~49.7 MB) loaded and the
+query still worked. `ensure_everything()` reports `ready` only when an ES query
+succeeds, otherwise `indexing`. Final verification: full `winbrow/tests` suite
+671 passed, 2 skipped; installer/finder-focused tests 7 passed.
+
+## 24. In-app env settings, chat tombstones, island/cancel fixes (2026-11-02)
+
+- **Settings tab / .env editor.** `winbrow/env_settings.py` owns a curated,
+  grouped catalog of environment fields (provider keys, agent budget, voice,
+  search, local model, advanced). `GET /api/env` returns effective values with
+  secrets masked (`is_set` only); `POST /api/env` merges `updates`/`unset` into
+  `.env` atomically, applies them to `os.environ`, and reports
+  `requires_restart`. Saving provider/model keys calls `reset_gateway()` +
+  `agent.rebuild_gateway()`. The React `Settings` tab (Dashboard ? Settings)
+  edits the same file, supports custom keys, and offers a sidecar restart for
+  startup-only fields.
+- **Values, defaults and source labels.** `/api/env` returns each field's
+  effective `value`, `default` and `source` (`env`, `process`, `default`).
+  Values from the real `.env` win; unset fields show the code default (computed
+  for Everything/wallpaper/image paths and thread count). The UI badges
+  `env` / `default` / `optional` and adds a `default: X` hint when a value
+  overrides it. The catalog covers all 60 keys in `.env.example`; only the four
+  genuinely optional keys (image user agent, extra artifact dirs, external
+  local endpoint/model) stay empty. `_SECRET_HINT` now requires a whole key
+  segment, so `WINBROW_CONTEXT_TOKENS` / `REASONING_MAX_TOKENS` /
+  `PLANNER_MAX_TOKENS` are no longer masked as secrets. Tests:
+  `test_env_settings.py` 9 passed.
+- **Deleted chats stay deleted.** `frontend/src/lib/useAgent.ts` tombstones
+  deleted session IDs in `localStorage` (`winbrow.deletedSessions`). `refresh()`
+  filters them from `/api/sessions` and retries the DELETE until the server
+  confirms it. This prevents a chat deleted while the sidecar was offline from
+  reappearing after an app restart.
+- **Dynamic island failure notice is transient.** `deriveIsland()` no longer
+  pins `phase=error` for a failed task until the next task. Failed, completed
+  and cancelled tasks all use the same 6-second hold before the pill returns to
+  Ready.
+- **Cancelled tasks drop their questions/options.** `cancel()`, the live
+  `task.cancelled` / `task.failed` reducers, the replay reducer, and
+  `finalizeFromExecution()` clear `needsInput`, `question` and `options`.
+  `Trace` and the Dashboard composer also refuse to render choices for
+  cancelled/failed tasks.
+- **Frontend build required.** `desktop.bat` only builds when `dist/index.html`
+  is missing, so run `cmd /c "npm run build"` in `frontend/` after source
+  changes. Tests: `npm test` 61 passed; `test_env_settings.py` 6 passed.

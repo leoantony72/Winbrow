@@ -666,13 +666,19 @@ def _schema_args(schema: dict) -> List[Tuple[str, dict]]:
     return out
 
 
-def _schema_argspec(name: str, meta: dict) -> "ArgSpec":  # noqa: F821
+def _schema_argspec(name: str, meta: dict, required: Optional[bool] = None) -> "ArgSpec":  # noqa: F821
     from .registry import ArgSpec
     instr = str((meta or {}).get("description", ""))[:160] or f"mcp arg {name}"
     default = (meta or {}).get("default")
-    return ArgSpec(name=name, kind="text", instructions=instr,
+    schema_type = str((meta or {}).get("type") or "").lower()
+    # Arrays/objects are valid JSON arguments; the text-only check in
+    # validate_steps would reject them as "not a scalar value".
+    kind = "json" if schema_type in {"array", "object"} else "text"
+    if "enum" in (meta or {}) and schema_type in {"string", ""}:
+        kind = "enum"
+    return ArgSpec(name=name, kind=kind, instructions=instr,
                    default=str(default) if default is not None else None,
-                   criteria={})
+                   criteria={}, required=required)
 
 
 def _examples_for(spec: "McpServerSpec", tool: dict) -> List[str]:  # noqa: F821
@@ -710,7 +716,10 @@ def _register_hub_tools(hub: McpHub, registry) -> int:
             args = []
             try:
                 for arg_name, info in _schema_args(t.get("inputSchema", {})):
-                    args.append(_schema_argspec(arg_name, info.get("meta", {})))
+                    args.append(_schema_argspec(
+                        arg_name, info.get("meta", {}),
+                        info.get("required"),
+                    ))
             except Exception as e:
                 log.debug(f"MCP arg mapping failed {full}: {e}")
             try:
@@ -758,7 +767,10 @@ def get_mcp_tools(registry, hub: Optional["McpHub"] = None) -> List["Tool"]:  # 
             args = []
             try:
                 for arg_name, info in _schema_args(t.get("inputSchema", {})):
-                    args.append(_schema_argspec(arg_name, info.get("meta", {})))
+                    args.append(_schema_argspec(
+                        arg_name, info.get("meta", {}),
+                        info.get("required"),
+                    ))
             except Exception as e:
                 log.debug(f"MCP arg mapping failed {full}: {e}")
             registered.append(Tool(

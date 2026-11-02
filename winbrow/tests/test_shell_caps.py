@@ -72,3 +72,16 @@ def test_blocked_command_is_rejected_before_script_write(tmp_path, monkeypatch):
     assert out["success"] is False
     assert "blocked by policy" in out["output"].lower()
     assert not list((tmp_path / "scripts").glob("*.ps1"))
+
+
+def test_headless_pdf_export_is_routed_to_the_skill_helper():
+    command = (
+        "chrome.exe --headless=new --disable-gpu "
+        "--print-to-pdf=C:\\Users\\me\\Desktop\\out.pdf "
+        "file:///C:/Users/me/Desktop/deck.html"
+    )
+    out = _run(shell.execute_shell_tool("run_command", {"command": command}))
+    assert out["success"] is False
+    assert "render_deck.py" in out["output"]
+    assert "pdf_tool.py" in out["output"]
+    assert "run_command" in out["output"]

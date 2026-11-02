@@ -1,7 +1,12 @@
 ---
 knowledge: 01-system-architecture
-last_verified: 2026-10-25
+last_verified: 2026-11-01
 source_files:
+  - frontend/src/Dashboard.tsx
+  - frontend/src/Island.tsx
+  - frontend/src/components/ui/dynamic-island.tsx
+  - frontend/src/workspace.css
+  - frontend/package.json
   - server.py
   - run.py
   - start.bat
@@ -15,13 +20,22 @@ source_files:
   - winbrow/policy.py
   - winbrow/brain/__init__.py
   - winbrow/brain/model_gateway.py
+  - winbrow/brain/agent_loop.py
+  - winbrow/brain/prompt.py
+  - winbrow/brain/batching.py
+  - winbrow/browser_task.py
+  - winbrow/browser_credentials.py
+  - winbrow/execution.py
   - requirements.txt
   - .env.example
 ---
 
 # 01 — System Architecture
 
-Verified 2026-10-25 against the working tree (HEAD `b82cfb2`, plus uncommitted skill-writer work).
+Backend snapshot verified 2026-10-25 against the working tree (HEAD `b82cfb2`, plus uncommitted skill-writer work).
+Electron renderer section verified 2026-11-01 against source and renderer tests;
+the guarded-batching section (§4.8) and its config/dependency entries were
+verified 2026-11-01. This does not re-verify the older backend line references.
 
 ## 1. What WinBrow is
 
@@ -37,16 +51,16 @@ A Windows-first personal automation agent:
 
 ## 2. Entry points
 
-| Entry | File | What it does |
-|---|---|---|
-| Web server | `server.py` | FastAPI app; imports and constructs `WinBrowAgent()` at module import (`:74`) |
-| REST execute | `server.py:317` | `POST /api/execute` → `agent.execute(...)` |
-| REST browser | `server.py:691` | `POST /api/browser` → `BrowserController` actions |
-| WebSocket | `server.py:768` | `/ws` live events/broadcast |
-| Launchers | `run.py`, `start.bat` | Start uvicorn/server |
-| CLI | `winbrow/cli.py` | `python -m winbrow observe` (UIA tree/context dump) |
-| Voice | `winbrow/voice.py` | `python -m winbrow.voice` (wake word or push-to-talk) |
-| Direct API | `winbrow.agent.WinBrowAgent.execute()` (`:1033`) | Full command pipeline |
+| Entry        | File                                             | What it does                                                                  |
+| ------------ | ------------------------------------------------ | ----------------------------------------------------------------------------- |
+| Web server   | `server.py`                                      | FastAPI app; imports and constructs `WinBrowAgent()` at module import (`:74`) |
+| REST execute | `server.py:317`                                  | `POST /api/execute` → `agent.execute(...)`                                    |
+| REST browser | `server.py:691`                                  | `POST /api/browser` → `BrowserController` actions                             |
+| WebSocket    | `server.py:768`                                  | `/ws` live events/broadcast                                                   |
+| Launchers    | `run.py`, `start.bat`                            | Start uvicorn/server                                                          |
+| CLI          | `winbrow/cli.py`                                 | `python -m winbrow observe` (UIA tree/context dump)                           |
+| Voice        | `winbrow/voice.py`                               | `python -m winbrow.voice` (wake word or push-to-talk)                         |
+| Direct API   | `winbrow.agent.WinBrowAgent.execute()` (`:1033`) | Full command pipeline                                                         |
 
 `server.py` loads `.env` itself (`_load_env_file`, `:39`) before reading keys. It does **not**
 pass `ask_user_fn` into `WinBrowAgent`, so clarification cannot block interactively; the result
@@ -136,6 +150,43 @@ to 8000 total / 600 reasoning. Local llama.cpp/Qwen is opt-in.
 - OCR is pytesseract first, then Windows WinRT OCR through PowerShell (`computer/tools.py`).
 - App adapters use CLI/COM/JSX, not pywinauto.
 
+### 4.8 Guarded multi-action batches (2026-11-01)
+
+The planner may emit one `step` or a bounded `steps[]` (default 5, hard clamp
+10 via `WINBROW_MAX_ACTIONS_PER_TURN`). Batching is a backend-owned capability:
+
+- `brain/batching.py` holds reviewed, immutable `BatchPolicy` records keyed by
+  exact tool name + dispatcher impl. They decide ordered/parallel eligibility,
+  shared resource, barriers and the human-readable reason. Unknown, learned,
+  script, MCP, shell and meta/playbook calls are singleton barriers until a
+  record is reviewed; names, categories, permission tiers and model-supplied
+  flags do not grant eligibility.
+- `validate_steps()` preflights the whole array (shape, args/defaults/enums,
+  availability, subagent scope, conflict/duplicate checks, JSON safety, cap and
+  remaining budget) before any side effect. Invalid or oversized proposals are
+  rejected whole, never truncated.
+- `AgentBrain.handle()` executes members sequentially by default through the
+  normal `run_skill()` permission gate. `WINBROW_PARALLEL_READS` remains a
+  separate opt-in for reviewed independent reads only. Each member still
+  consumes one action-budget slot and emits its own history/event entry.
+- `execution.py` serialises top-level goals with a re-entrant `ContextVar`
+  lease; awaited children/subagents inherit it. `execute()`, `confirm_pending()`
+  and direct `POST /api/browser` actions acquire it, so REST/chat/WebSocket
+  approval or manual browser work cannot interleave with another goal.
+- Browser batches are pinned to the remembered agent tab and a per-document
+  token (`BrowserController.batch_state()`). Before the batch and after every
+  successful member, `WinBrowAgent._guard_batch()` requires the same document
+  identity and one connected/visible/enabled target per observed selector.
+  Navigation, same-URL reload, replaced/ambiguous targets and dialogs stop the
+  remaining queue. Child subagent brains receive the same guard but keep their
+  scoped tool/skill registry. Desktop has no reviewed window-state guard yet, so
+  desktop batches replan as single actions rather than mutating blindly.
+- Permission continuation stores the unexecuted suffix and exact normalized
+  arguments under the confirmation ID; approval resumes only that suffix.
+  `permissions.permission_scope` and full-argument `v2:` action keys bind the
+  grant to session/action/target. T3 stays one-shot; denial, expiry, changed
+  arguments or a lost cursor never replay completed work.
+
 ## 5. Component dependency sketch
 
 ```
@@ -143,7 +194,8 @@ server.py
   └─ WinBrowAgent (agent.py)
        ├─ ToolRegistry (registry.py) ── policy.py / windows.py
        ├─ WinBrowRouter (router.py) ── Laya worker, small_llm.py, resolvers.py
-       ├─ AgentBrain (brain/agent_loop.py) ── model_gateway.py, prompt.py, skill_registry.py
+       ├─ AgentBrain (brain/agent_loop.py) ── model_gateway.py, prompt.py, skill_registry.py, batching.py
+       ├─ ExecutionOwnership (execution.py) ── shared UI lease for goals/children
        ├─ BrowserController (browser_task.py) ── HTTP /json or CDP WebSocket
        ├─ PermissionManager (permissions.py) ── policy.py
        ├─ SessionMemory + MemoryStore (memory/)
@@ -162,34 +214,35 @@ of them prevents the server from starting.
 
 Important environment variables (full list in `.env.example` and the knowledge files):
 
-| Variable | Default | Effect |
-|---|---|---|
-| `NEBIUS_API_KEY` | empty | Nebius Token Factory key; first cloud provider in auto |
-| `WINBROW_NEBIUS_BASE` | `https://api.tokenfactory.nebius.com/v1` | Nebius OpenAI-compatible base |
-| `WINBROW_NEBIUS_MODEL` | `deepseek-ai/DeepSeek-V4-Flash-0731` | Nebius model ID |
-| `OPENROUTER_API_KEY` | empty | OpenRouter fallback key |
-| `WINBROW_BRAIN_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter model |
-| `WINBROW_BRAIN_PROVIDER` | `auto` | `auto` / `nebius` / `local` / `qwen` / `openrouter` / `openai` |
-| `WINBROW_MAX_STEPS` | `20` | Brain action budget |
-| `WINBROW_BRAIN_FIRST` | `1` | Every request attempts the brain before replay/MCP/browser/router |
-| `WINBROW_STEP_TIMEOUT` | `120` | Per-action timeout (seconds) |
-| `WINBROW_STEP_WARN` | `5` | Steps-remaining warning threshold |
-| `WINBROW_REASONING_MAX_TOKENS` | `2000` | Reasoning cap for structured calls |
-| `WINBROW_PLANNER_MAX_TOKENS` | `16000` | Planner total budget |
-| `WINBROW_BYPASS_CONFIRM` | unset | **Bypasses all permission tiers** |
-| `WINBROW_AUTO_APPROVE_T2` | unset | Auto-remembers T2 actions |
-| `WINBROW_BROWSER_MODE` | unset | `separate` uses a throwaway CDP profile |
-| `WINBROW_DISABLE_LAYA` | unset | Disables Laya in the router (not in ultrafast) |
-| `WINBROW_ROUTER_LLM` | unset | Enables the Ollama router tier |
-| `WINBROW_LOCAL_LLM` | unset | Starts local llama.cpp/Qwen |
-| `WINBROW_SKILLS_DIR` | `tools` | Overrides replay-skill storage |
-| `WINBROW_SUBAGENTS` | `1` | Set `0` to disable `delegate_task` |
-| `WINBROW_SUBAGENTS_EXPLICIT` | `0` | Set `1` to require an explicit subagent request |
-| `WINBROW_SUBAGENT_HISTORY` | `data/subagents.json` | Subagent run history |
-| `WINBROW_SUBAGENT_PARALLEL` | `3` | Max concurrent parallel-safe subagents |
-| `WINBROW_PERMISSIONS_DIR` | `tools` | Overrides `permissions.json` |
-| `WINBROW_TTS` | `1` | SAPI speech enabled by default |
-| `WINBROW_CLOUD_VISION` | unset | Enables the VLM grounding rung |
+| Variable                       | Default                                  | Effect                                                            |
+| ------------------------------ | ---------------------------------------- | ----------------------------------------------------------------- |
+| `NEBIUS_API_KEY`               | empty                                    | Nebius Token Factory key; first cloud provider in auto            |
+| `WINBROW_NEBIUS_BASE`          | `https://api.tokenfactory.nebius.com/v1` | Nebius OpenAI-compatible base                                     |
+| `WINBROW_NEBIUS_MODEL`         | `deepseek-ai/DeepSeek-V4-Flash-0731`     | Nebius model ID                                                   |
+| `OPENROUTER_API_KEY`           | empty                                    | OpenRouter fallback key                                           |
+| `WINBROW_BRAIN_MODEL`          | `deepseek/deepseek-v4.1-flash`           | OpenRouter model                                                  |
+| `WINBROW_BRAIN_PROVIDER`       | `auto`                                   | `auto` / `nebius` / `local` / `qwen` / `openrouter` / `openai`    |
+| `WINBROW_MAX_STEPS`            | `20`                                     | Brain action budget                                               |
+| `WINBROW_MAX_ACTIONS_PER_TURN` | `5`                                      | Max `steps[]` per planner response; clamp 1–10                    |
+| `WINBROW_BRAIN_FIRST`          | `1`                                      | Every request attempts the brain before replay/MCP/browser/router |
+| `WINBROW_STEP_TIMEOUT`         | `120`                                    | Per-action timeout (seconds)                                      |
+| `WINBROW_STEP_WARN`            | `5`                                      | Steps-remaining warning threshold                                 |
+| `WINBROW_REASONING_MAX_TOKENS` | `2000`                                   | Reasoning cap for structured calls                                |
+| `WINBROW_PLANNER_MAX_TOKENS`   | `16000`                                  | Planner total budget                                              |
+| `WINBROW_BYPASS_CONFIRM`       | unset                                    | **Bypasses all permission tiers**                                 |
+| `WINBROW_AUTO_APPROVE_T2`      | unset                                    | Auto-remembers T2 actions                                         |
+| `WINBROW_BROWSER_MODE`         | unset                                    | `separate` uses a throwaway CDP profile                           |
+| `WINBROW_DISABLE_LAYA`         | unset                                    | Disables Laya in the router (not in ultrafast)                    |
+| `WINBROW_ROUTER_LLM`           | unset                                    | Enables the Ollama router tier                                    |
+| `WINBROW_LOCAL_LLM`            | unset                                    | Starts local llama.cpp/Qwen                                       |
+| `WINBROW_SKILLS_DIR`           | `tools`                                  | Overrides replay-skill storage                                    |
+| `WINBROW_SUBAGENTS`            | `1`                                      | Set `0` to disable `delegate_task`                                |
+| `WINBROW_SUBAGENTS_EXPLICIT`   | `0`                                      | Set `1` to require an explicit subagent request                   |
+| `WINBROW_SUBAGENT_HISTORY`     | `data/subagents.json`                    | Subagent run history                                              |
+| `WINBROW_SUBAGENT_PARALLEL`    | `3`                                      | Max concurrent parallel-safe subagents                            |
+| `WINBROW_PERMISSIONS_DIR`      | `tools`                                  | Overrides `permissions.json`                                      |
+| `WINBROW_TTS`                  | `1`                                      | SAPI speech enabled by default                                    |
+| `WINBROW_CLOUD_VISION`         | unset                                    | Enables the VLM grounding rung                                    |
 
 ## 7. Dependencies and environment
 
@@ -202,20 +255,20 @@ optional `uiautomation` (CLI observe fallback). `psutil` is a hard import in `wi
 
 Default data locations:
 
-| Path | Contents |
-|---|---|
-| `data/memory.db` | SQLite episodic memory + FTS5 |
-| `data/chroma/` | Optional vector store |
-| `data/observe/` | VLM budget, dismissed suggestions |
-| `data/subagents.json` | Last 50 subagent runs (gitignored) |
-| `tools/seed.json` | Built-in script tools |
-| `tools/learned.json` | Generated/persisted tools |
-| `tools/skills.json` | Procedural replay records |
-| `tools/permissions.json` | Remembered T2 allowlist + pending |
-| `tools/session_state.json` | Last 5 sessions/turns/entities |
-| `tools/mcp_servers.json` | MCP server specs |
-| `tools/mcp_cache.json` | Cached MCP tool catalogs |
-| `logs/trace.jsonl` | Stage/command trace |
+| Path                       | Contents                           |
+| -------------------------- | ---------------------------------- |
+| `data/memory.db`           | SQLite episodic memory + FTS5      |
+| `data/chroma/`             | Optional vector store              |
+| `data/observe/`            | VLM budget, dismissed suggestions  |
+| `data/subagents.json`      | Last 50 subagent runs (gitignored) |
+| `tools/seed.json`          | Built-in script tools              |
+| `tools/learned.json`       | Generated/persisted tools          |
+| `tools/skills.json`        | Procedural replay records          |
+| `tools/permissions.json`   | Remembered T2 allowlist + pending  |
+| `tools/session_state.json` | Last 5 sessions/turns/entities     |
+| `tools/mcp_servers.json`   | MCP server specs                   |
+| `tools/mcp_cache.json`     | Cached MCP tool catalogs           |
+| `logs/trace.jsonl`         | Stage/command trace                |
 
 ## 8. Boundaries and invariants
 
@@ -226,3 +279,28 @@ Default data locations:
 - Do not assume `screen_read_text` runs for every desktop action.
 - Do not assume the two skill systems are interchangeable.
 - Do not assume tests cover live CDP/UIA/COM behavior.
+
+## 9. Electron renderer (2026-11-01)
+
+- `frontend/` is a separate React 18 + strict TypeScript + Vite Electron UI.
+  Python remains the execution authority; no new execution or permission route
+  was added by the UI refresh.
+- `src/Dashboard.tsx` keeps chat history, task traces/results, follow-ups,
+  explicit Allow/Deny, cancellation, voice toggle, Server activity, and window
+  controls. The refreshed welcome cards populate the composer without running
+  a task. Busy/offline submissions are blocked; IME Enter does not submit.
+- `src/Island.tsx` still derives priority from `src/lib/islandState.ts`, owns
+  confirmation expiry/auto-collapse, and sends ResizeObserver dimensions to
+  Electron. Its shell now uses `components/ui/dynamic-island.tsx` with explicit
+  196/404/460px widths and auto height. The main process still owns focus and
+  click-through; the provider does not execute actions.
+- `components.json` configures shadcn paths under `src/components/ui`; `@/`
+  resolves to `src/` in TS/Vite/Vitest. Tailwind 3 scans TSX with Preflight off
+  to preserve legacy styles. `src/styles.css` contains shared CSS/tokens;
+  `src/workspace.css` isolates dashboard visuals and responsive overrides.
+- `?win=component-demo` renders the independent showcase without `useAgent`.
+  Existing `?win=island&demo=<state>&open=1` and dashboard demos remain available.
+- Verification commands: `npm test`, `npm run build`, `npm run test:electron`
+  from `frontend/`. Tests mock backend/IPC; Electron smoke loads the built
+  fixture renderer and writes ignored screenshots to `logs/ui-smoke/`.
+  Neither validates live tool execution. See `frontend/README.md`.

@@ -176,22 +176,6 @@ export function deriveIsland(
         goal: task.goal,
       };
     }
-
-    // 3. Failures persist until another task starts.
-    if (task.status === "failed") {
-      const message = task.error || task.answer || "Task failed.";
-      return {
-        ...base,
-        phase: "error",
-        size: "medium",
-        status: "Failed",
-        detail: snippet(message, 120),
-        error: message,
-        retryGoal: task.goal,
-        goal: task.goal,
-        canCancel: false,
-      };
-    }
   }
 
   // 4. Voice.
@@ -222,7 +206,7 @@ export function deriveIsland(
 
   // 5. A clarifying question also blocks the run, but there is no permission
   //    prompt: show the question with the normal card and a question icon.
-  if (task?.needsInput) {
+  if (task?.needsInput && task.status !== "cancelled" && task.status !== "failed") {
     const question = task.question || task.answer || task.goal;
     return {
       ...base,
@@ -265,20 +249,28 @@ export function deriveIsland(
     };
   }
 
-  // 7. Transient success / cancellation notice.
+  // 7. Transient success / failure / cancellation notice.
   const doneRecent =
     task &&
-    (task.status === "completed" || task.status === "cancelled") &&
+    (task.status === "completed" ||
+      task.status === "cancelled" ||
+      task.status === "failed") &&
     now - task.updatedAt < DONE_HOLD_MS;
   const pinnedDone = agent.demo === "done" && task;
   if ((doneRecent || pinnedDone) && task) {
     const stopped = task.status === "cancelled";
+    const failed = task.status === "failed";
+    const message = failed
+      ? task.error || task.answer || "Task failed."
+      : task.answer || task.summary || "";
     return {
       ...base,
-      phase: "done",
+      phase: failed ? "error" : "done",
       size: "small",
-      status: stopped ? "Stopped" : "Done",
-      answer: snippet(task.answer || task.summary || "", 160),
+      status: failed ? "Failed" : stopped ? "Stopped" : "Done",
+      answer: snippet(message, 160),
+      error: failed ? message : undefined,
+      retryGoal: failed ? task.goal : "",
       goal: task.goal,
     };
   }

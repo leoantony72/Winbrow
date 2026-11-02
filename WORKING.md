@@ -355,7 +355,7 @@ typed `args` (`enum` with choice criteria, or free `text`), a `speak` mode,
 | 14 | `kill_unresponsive_process` | Kill hung or named processes | target text |
 | 15 | `network_status` | Local IP + internet ping check | — |
 | 16 | `current_time` | Time, date, timezone, weekday | — |
-| 17 | `find_files` | Name search across Desktop/Documents/Downloads/Pictures | search_term text |
+| 17 | `find_files` | Everything `es.exe` name search across indexed drives | search_term text |
 | 18 | `open_folder` | System folders **and** arbitrary named folders/paths | folder text |
 | 19 | `volume_set_level` | Exact 0–100 volume (native API, no PowerShell) | level text |
 | 20 | `screen_brightness` | WMI brightness up/down/max/min/half | action enum |

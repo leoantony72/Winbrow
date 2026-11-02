@@ -1,16 +1,13 @@
 ---
-name: "play-youtube-video"
-skill: "play_youtube_video"
-args:
-  - name: "search_query"
-    type: "string"
-    required: true
-    default: null
-    description: "The search term to look up on YouTube, e.g., 'latest trailer' or a movie name."
+name: play-youtube-video
+skill: playbook_play_youtube_video
+kind: playbook
+category: creative-media
+args: []
 description: >
   Searches YouTube for a given query and plays the first video result. Use
-  when the user wants to watch or play a video on YouTube based on a search
-  term. Not for downloading videos or extracting transcripts.
+  when the user wants to watch or play a video on YouTube based on a
+  search term. Not for downloading videos or extracting transcripts.
 ---
 
 ## When to Use

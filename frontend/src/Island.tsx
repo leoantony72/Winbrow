@@ -4,6 +4,11 @@ import type { AgentState } from "./lib/useAgent";
 import type { IslandPhase, MicState } from "./lib/islandState";
 import { deriveIsland } from "./lib/islandState";
 import { argHint, skillVerb } from "./lib/format";
+import {
+  Component as DynamicIsland,
+  DynamicIslandProvider,
+  useDynamicIslandSize,
+} from "@/components/ui/dynamic-island";
 
 const AUTO_COLLAPSE_MS = 8000;
 
@@ -99,6 +104,15 @@ function formatCountdown(ms: number): string {
 }
 
 export default function Island({ agent }: { agent: AgentState }) {
+  return (
+    <DynamicIslandProvider>
+      <IslandContent agent={agent} />
+    </DynamicIslandProvider>
+  );
+}
+
+function IslandContent({ agent }: { agent: AgentState }) {
+  const { setSize } = useDynamicIslandSize();
   const [expanded, setExpanded] = useState(
     () => new URLSearchParams(location.search).get("open") === "1",
   );
@@ -179,7 +193,12 @@ export default function Island({ agent }: { agent: AgentState }) {
 
   useEffect(() => {
     touch();
-  }, [view.phase, agent.voice.partial, agent.voice.spoken, agent.active?.updatedAt]);
+  }, [
+    view.phase,
+    agent.voice.partial,
+    agent.voice.spoken,
+    agent.active?.updatedAt,
+  ]);
 
   // Context (active app / window) is only useful in the card or the control
   // banner; do not scan the desktop while the idle pill is showing.
@@ -298,6 +317,16 @@ export default function Island({ agent }: { agent: AgentState }) {
 
   const phaseClass = `state-${view.phase}`;
   const sizeClass = `size-${expanded ? "large" : view.size}`;
+  const islandWidth = expanded ? 460 : view.size === "small" ? 196 : 404;
+  const preset = expanded
+    ? "medium"
+    : view.size === "small"
+      ? "default"
+      : "compactLong";
+
+  useEffect(() => {
+    setSize(preset);
+  }, [preset, setSize]);
 
   return (
     <div
@@ -306,7 +335,10 @@ export default function Island({ agent }: { agent: AgentState }) {
       onMouseEnter={touch}
       onMouseMove={touch}
     >
-      <motion.div
+      <DynamicIsland
+        id="winbrow-dynamic-island"
+        width={islandWidth}
+        height="auto"
         layout
         className={`island ${sizeClass} ${phaseClass} ${
           expanded ? "island-expanded" : ""
@@ -364,9 +396,7 @@ export default function Island({ agent }: { agent: AgentState }) {
             <PhaseIcon phase={view.phase} />
           )}
 
-          {view.detail &&
-          view.phase !== "idle" &&
-          view.phase !== "control" ? (
+          {view.detail && view.phase !== "idle" && view.phase !== "control" ? (
             <span className="island-detail" title={view.detail}>
               {view.detail}
             </span>
@@ -404,7 +434,14 @@ export default function Island({ agent }: { agent: AgentState }) {
               }}
             >
               <svg viewBox="0 0 10 10" width="8" height="8" aria-hidden>
-                <rect x="1" y="1" width="8" height="8" rx="1.6" fill="currentColor" />
+                <rect
+                  x="1"
+                  y="1"
+                  width="8"
+                  height="8"
+                  rx="1.6"
+                  fill="currentColor"
+                />
               </svg>
             </button>
           ) : null}
@@ -485,10 +522,14 @@ export default function Island({ agent }: { agent: AgentState }) {
                     ) : null}
                   </div>
                   <div className="confirm-args">
-                    {confirm.message || argHint(confirm.args) || "Allow this action?"}
+                    {confirm.message ||
+                      argHint(confirm.args) ||
+                      "Allow this action?"}
                   </div>
                   {argHint(confirm.args) && confirm.message ? (
-                    <div className="confirm-args confirm-path">{argHint(confirm.args)}</div>
+                    <div className="confirm-args confirm-path">
+                      {argHint(confirm.args)}
+                    </div>
                   ) : null}
                   <div className="island-actions">
                     <button
@@ -497,7 +538,10 @@ export default function Island({ agent }: { agent: AgentState }) {
                     >
                       Allow
                     </button>
-                    <button className="btn" onClick={() => agent.respond(false)}>
+                    <button
+                      className="btn"
+                      onClick={() => agent.respond(false)}
+                    >
                       Deny
                     </button>
                     <span className="island-spacer" />
@@ -520,7 +564,9 @@ export default function Island({ agent }: { agent: AgentState }) {
                     <div className="island-control-copy">
                       <div className="control-row">
                         <span className="control-label">target</span>
-                        <span className="control-target">{view.controlTarget}</span>
+                        <span className="control-target">
+                          {view.controlTarget}
+                        </span>
                       </div>
                       <div className="control-hint">
                         Kill switch is always reachable: Stop above, or press
@@ -550,7 +596,9 @@ export default function Island({ agent }: { agent: AgentState }) {
                     <div className="island-convo">
                       <div className="bubble bubble-agent">
                         <span className="bubble-label">WinBrow</span>
-                        <span className="bubble-text">{agent.voice.spoken}</span>
+                        <span className="bubble-text">
+                          {agent.voice.spoken}
+                        </span>
                       </div>
                     </div>
                   ) : null}
@@ -578,7 +626,9 @@ export default function Island({ agent }: { agent: AgentState }) {
                   ) : null}
 
                   {view.error ? (
-                    <div className="island-answer island-error">{view.error}</div>
+                    <div className="island-answer island-error">
+                      {view.error}
+                    </div>
                   ) : null}
 
                   {!connected ? (
@@ -634,7 +684,9 @@ export default function Island({ agent }: { agent: AgentState }) {
                     <button
                       className="chip"
                       onClick={() =>
-                        quick("Take a screenshot and tell me what is on my screen.")
+                        quick(
+                          "Take a screenshot and tell me what is on my screen.",
+                        )
                       }
                     >
                       Screenshot &amp; ask
@@ -723,7 +775,9 @@ export default function Island({ agent }: { agent: AgentState }) {
                       <span className="context-eye" aria-hidden>
                         ◉
                       </span>
-                      <span className="context-app">{agent.context.active_app}</span>
+                      <span className="context-app">
+                        {agent.context.active_app}
+                      </span>
                       {agent.context.active_title ? (
                         <span className="context-title">
                           {agent.context.active_title}
@@ -742,7 +796,10 @@ export default function Island({ agent }: { agent: AgentState }) {
                           Retry
                         </button>
                       ) : null}
-                      <button className="btn btn-primary" onClick={openDashboard}>
+                      <button
+                        className="btn btn-primary"
+                        onClick={openDashboard}
+                      >
                         Open
                       </button>
                     </div>
@@ -752,7 +809,7 @@ export default function Island({ agent }: { agent: AgentState }) {
             </motion.div>
           ) : null}
         </AnimatePresence>
-      </motion.div>
+      </DynamicIsland>
     </div>
   );
 }

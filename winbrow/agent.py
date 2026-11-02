@@ -34,7 +34,9 @@ from .brain.agent_loop import (
     subagents_explicit_only,
 )
 from .brain.agent_loop import COMPUTER_SKILL_DISPATCH, _ctx_block
+from .brain.batching import policy_for
 from .brain.model_gateway import extract_json_object
+from .execution import ExecutionOwnership
 from .brain.prompts import build_chat_messages
 from .memory.skills import (
     MissingSkillParameters,
@@ -376,6 +378,9 @@ class WinBrowAgent:
         # Last successfully activated app in this turn. A planner that omits
         # type_text's optional app argument still gets its focus re-verified.
         self._last_focus_target: Optional[dict[str, Any]] = None
+        # Serialize shared UI state across top-level goals. Awaited children in
+        # the same goal inherit the lease, so subagents can still run.
+        self.execution = ExecutionOwnership()
         self.brain = AgentBrain(
             gateway=self.gateway,
             registry=self.registry,
@@ -383,6 +388,7 @@ class WinBrowAgent:
             executor=self.run_skill,
             tool_builder=self.build_new_tool,
             ask_user_fn=self.ask_user_fn,
+            batch_guard=self._guard_batch,
         )
         self.subagents = SubagentManager(self)
 
@@ -402,9 +408,139 @@ class WinBrowAgent:
             executor=self.run_skill,
             tool_builder=self.build_new_tool,
             ask_user_fn=self.ask_user_fn,
+            batch_guard=self._guard_batch,
         )
 
     # ------------------------------------------------------------------ shared skill executor
+    async def _guard_batch(
+        self, steps: list[dict], state: Optional[dict], completed_skill: str = ""
+    ) -> dict[str, Any]:
+        """Revalidate the shared UI state between multi-action batch members.
+
+        Called before a batch and after every successful member. Browser work
+        is pinned to the remembered agent tab/document, and every remaining
+        selector must keep the observed identity, uniqueness and actionability.
+        Desktop work has no deterministic window guard yet, so it stays a
+        singleton instead of being silently interleaved with other mutations.
+        """
+        policies = [
+            policy_for(
+                str(step.get("skill", "")),
+                self.registry.get(str(step.get("skill", ""))),
+                dict(step.get("args") or {}),
+            )
+            for step in steps
+        ]
+        if any(policy.resource == "desktop" for policy in policies):
+            return {
+                "success": False,
+                "state": None,
+                "replan": True,
+                "output": (
+                    "Desktop actions need an observed window guard; run them "
+                    "as single actions so the state is checked between them."
+                ),
+            }
+        if not any(policy.resource == "browser" for policy in policies):
+            # Filesystem/web/document contracts verify their own effects and
+            # do not share the browser or foreground desktop.
+            return {"success": True, "state": state, "output": ""}
+
+        selectors: list[str] = []
+        for step, policy in zip(steps, policies):
+            if policy.resource != "browser":
+                continue
+            selector = (step.get("args") or {}).get("selector")
+            if isinstance(selector, str) and selector.strip():
+                selectors.append(selector.strip())
+        snapshot = await self.browser.batch_state(list(dict.fromkeys(selectors)))
+        if not snapshot.get("success"):
+            return {
+                "success": False,
+                "state": None,
+                "output": (
+                    "Browser state could not be revalidated: "
+                    f"{snapshot.get('error') or 'unknown error'}. Observe again "
+                    "before continuing."
+                ),
+            }
+        identity = snapshot.get("identity") or {}
+        targets = snapshot.get("targets") or {}
+        if state is None:
+            for selector in selectors:
+                signature = targets.get(selector) or {}
+                if not signature.get("exists"):
+                    return {
+                        "success": False,
+                        "state": None,
+                        "output": f"Target '{selector}' is no longer on the page.",
+                    }
+                if signature.get("count") != 1:
+                    return {
+                        "success": False,
+                        "state": None,
+                        "output": (
+                            f"Target '{selector}' is ambiguous "
+                            f"({signature.get('count')} matches); observe and "
+                            "choose one exact selector."
+                        ),
+                    }
+                if not signature.get("connected") or not signature.get("visible"):
+                    return {
+                        "success": False,
+                        "state": None,
+                        "output": f"Target '{selector}' is not visible.",
+                    }
+                if signature.get("disabled"):
+                    return {
+                        "success": False,
+                        "state": None,
+                        "output": f"Target '{selector}' is disabled.",
+                    }
+            return {
+                "success": True,
+                "state": {"identity": identity, "targets": targets},
+                "output": "",
+            }
+
+        if identity != state.get("identity"):
+            return {
+                "success": False,
+                "state": None,
+                "output": (
+                    "The page navigated or reloaded during the batch; queued "
+                    "commands were not executed."
+                ),
+            }
+        known = state.get("targets") or {}
+        for selector in selectors:
+            if selector not in known:
+                return {
+                    "success": False,
+                    "state": None,
+                    "output": (
+                        f"Target '{selector}' was not observed before the "
+                        "batch; observe it first."
+                    ),
+                }
+            if targets.get(selector) != known[selector]:
+                return {
+                    "success": False,
+                    "state": None,
+                    "output": (
+                        f"Target '{selector}' changed during the batch; "
+                        "queued commands were not executed."
+                    ),
+                }
+        return {
+            "success": True,
+            "state": {
+                "identity": identity,
+                "targets": {**known, **targets},
+            },
+            "output": "",
+        }
+
     async def _open_requested_browser(self, app_name: str) -> dict[str, Any]:
         """Open/focus a browser the user named, keeping it under agent control.
 
@@ -1488,6 +1624,165 @@ class WinBrowAgent:
         emit: Optional[Any] = None,
         session_id: str = "default",
     ) -> dict[str, Any]:
+        """Run one top-level goal while owning the shared browser/desktop state.
+
+        Nested calls from the same goal (approval continuation, subagents) inherit
+        the lease; a separate request waits until the foreground and agent tab
+        are released instead of interleaving mutations.
+        """
+        async with self.execution.hold():
+            return await self._execute_turn(
+                utterance,
+                api_key=api_key,
+                provider=provider,
+                custom_endpoint=custom_endpoint,
+                project_id=project_id,
+                emit=emit,
+                session_id=session_id,
+            )
+
+    async def confirm_pending(
+        self,
+        confirmation_id: str,
+        approve: bool,
+        *,
+        remember: bool = False,
+        session_id: Optional[str] = None,
+        emit: Optional[Any] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve one pending approval and resume only its unexecuted suffix.
+
+        Approval can arrive over REST, WebSocket or chat while another request
+        may be running, so the resumed segment reacquires the same shared-state
+        lease as a normal goal. Returns None when the id is unknown, expired or
+        belongs to another session. A brain cursor resumes the exact queued
+        member and skips the completed prefix; a pending from a non-brain path
+        keeps the legacy single-action replay behavior.
+        """
+        async with self.execution.hold():
+            return await self._confirm_pending(
+                confirmation_id,
+                approve,
+                remember=remember,
+                session_id=session_id,
+                emit=emit,
+            )
+
+    async def _confirm_pending(
+        self,
+        confirmation_id: str,
+        approve: bool,
+        *,
+        remember: bool = False,
+        session_id: Optional[str] = None,
+        emit: Optional[Any] = None,
+    ) -> Optional[dict[str, Any]]:
+        from .permissions import get_permissions
+
+        pm = get_permissions()
+        pending = (
+            pm.get_pending(confirmation_id, session_id=session_id)
+            if session_id
+            else pm.get_pending(confirmation_id)
+        )
+        if pending is None or (session_id and pending.session_id != session_id):
+            self.brain.discard_continuation(confirmation_id)
+            return None
+        sid = pending.session_id or "default"
+        pm.resolve_pending(
+            pending.id,
+            approve=approve,
+            remember=bool(remember) or pending.tier == "t2",
+            session_id=sid,
+        )
+        if not approve:
+            self.brain.discard_continuation(pending.id)
+            pm.consume_pending(pending.id, session_id=sid)
+            return {
+                "utterance": pending.utterance,
+                "route": {
+                    "kind": "stop",
+                    "tool_name": pending.tool,
+                    "args": pending.args,
+                    "tier": "permission",
+                },
+                "context": {},
+                "execution": {
+                    "type": "denied",
+                    "success": False,
+                    "output": f"Action '{pending.tool}' was denied by user.",
+                },
+                "total_elapsed_ms": 1.0,
+            }
+        if self.brain.has_continuation(pending.id):
+            started = time.perf_counter()
+            brain_res = await self.brain.resume_pending(
+                pending.id, sid, emit=emit
+            )
+            return self._record_resumed_goal(pending, brain_res, started)
+        # Legacy pending (fast path/generator) has no guarded prefix to keep;
+        # re-running the cached single action is the old, safe fallback.
+        result = await self.execute(
+            pending.utterance, session_id=sid, emit=emit
+        )
+        pm.consume(pending.tool, pending.args)
+        return result
+
+    def _record_resumed_goal(
+        self, pending: Any, brain_res: Any, started: float
+    ) -> dict[str, Any]:
+        """Record a permission-resumed brain run in the same shape as execute()."""
+        execution = brain_res.to_dict()
+        total_ms = round((time.perf_counter() - started) * 1000, 1)
+        session_id = pending.session_id or "default"
+        session = self.session if session_id == "default" else get_session(session_id)
+        result: dict[str, Any] = {
+            "utterance": pending.utterance,
+            "route": {
+                "kind": "brain",
+                "tool_name": "brain",
+                "args": {"goal": pending.utterance},
+                "confidence": 1.0,
+                "latency_ms": 0,
+                "probabilities": {},
+                "tier": "permission_resume",
+            },
+            "context": {},
+            "execution": execution,
+            "total_elapsed_ms": total_ms,
+        }
+        self._trace_brain_run(
+            pending.utterance,
+            str(execution.get("run_id") or ""),
+            str(execution.get("kind") or ""),
+            bool(execution.get("success")),
+            len(execution.get("steps") or []),
+            total_ms,
+            execution=execution,
+        )
+        self.history.append(result)
+        if len(self.history) > 100:
+            self.history = self.history[-100:]
+        try:
+            session.record_turn(pending.utterance, result["route"], execution)
+            self.store.record_command(
+                pending.utterance, result["route"], execution, total_ms
+            )
+        except Exception as exc:
+            log.debug(f"Memory recording failed (non-fatal): {exc}")
+        return result
+
+    async def _execute_turn(
+        self,
+        utterance: str,
+        api_key: Optional[str] = None,
+        provider: str = "auto",
+        custom_endpoint: Optional[str] = None,
+        project_id: Optional[str] = None,
+        *,
+        emit: Optional[Any] = None,
+        session_id: str = "default",
+    ) -> dict[str, Any]:
         """
         Process user command end-to-end:
         1. Brain first for every request when a provider is available
@@ -1525,28 +1820,36 @@ class WinBrowAgent:
         if clean_words in ("yes", "approve", "confirm", "allow", "proceed", "go ahead", "do it", "sure", "yep", "ok do it", "accept"):
             from .permissions import get_permissions
             pm = get_permissions()
-            pending_list = pm.pending_list()
+            pending_list = pm.pending_list(session_id) or pm.pending_list()
             if pending_list:
                 last_pending = pending_list[-1]
-                remember = last_pending.get("tier") == "t2"
-                pm.resolve_pending(last_pending["confirmation_id"], approve=True, remember=remember)
-                pm.consume(last_pending["tool"], last_pending["args"])
-                log.info(f"User approved pending action '{last_pending['tool']}' via chat: re-running '{last_pending['utterance']}'")
-                return await self.execute(last_pending["utterance"], session_id=session_id)
+                result = await self.confirm_pending(
+                    last_pending["confirmation_id"],
+                    True,
+                    remember=last_pending.get("tier") == "t2",
+                    session_id=last_pending.get("session_id") or session_id,
+                    emit=emit,
+                )
+                if result is not None:
+                    log.info(
+                        "User approved pending action '%s' via chat; resuming "
+                        "the unexecuted suffix.",
+                        last_pending["tool"],
+                    )
+                    return result
         elif clean_words in ("no", "deny", "cancel", "reject", "don't do it", "dont"):
             from .permissions import get_permissions
             pm = get_permissions()
-            pending_list = pm.pending_list()
+            pending_list = pm.pending_list(session_id) or pm.pending_list()
             if pending_list:
                 last_pending = pending_list[-1]
-                pm.resolve_pending(last_pending["confirmation_id"], approve=False)
-                pm.consume(last_pending["tool"], last_pending["args"])
-                return {
-                    "utterance": utterance,
-                    "route": {"kind": "stop", "tier": "permission"},
-                    "execution": {"type": "denied", "success": False, "output": f"Action '{last_pending['tool']}' was denied by user."},
-                    "total_elapsed_ms": 1.0,
-                }
+                result = await self.confirm_pending(
+                    last_pending["confirmation_id"],
+                    False,
+                    session_id=last_pending.get("session_id") or session_id,
+                )
+                if result is not None:
+                    return result
 
         # ── v3/M2: procedural replay ──
         # A captured skill matching this utterance replays its exact steps

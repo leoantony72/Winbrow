@@ -79,11 +79,20 @@ class TestTiers(unittest.TestCase):
         self.assertEqual(script_tier("reg add HKLM\\x"), "t3")
 
     def test_action_key_stable(self):
-        a = action_key("open_app", {"app": "notepad"})
-        b = action_key("open_app", {"APP": " Notepad "})
-        c = action_key("open_app", {"app": "calc"})
-        self.assertEqual(a, b)          # normalized: case + whitespace
+        a = action_key("open_app", {"app": "notepad", "title": "Notes"})
+        b = action_key("open_app", {"title": "Notes", "app": "notepad"})
+        c = action_key("open_app", {"app": "calc", "title": "Notes"})
+        self.assertEqual(a, b)
         self.assertNotEqual(a, c)
+        self.assertNotEqual(
+            a, action_key("open_app", {"APP": "notepad", "title": "Notes"})
+        )
+        self.assertNotEqual(
+            a, action_key("open_app", {"app": "Notepad", "title": "Notes"})
+        )
+        self.assertNotEqual(
+            a, action_key("open_app", {"app": " notepad ", "title": "Notes"})
+        )
 
 
 class TestGate(unittest.TestCase):

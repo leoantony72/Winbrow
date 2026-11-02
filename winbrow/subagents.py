@@ -302,6 +302,10 @@ class SubagentManager:
             allowed_skills=allowed,
             system_prompt=SUBAGENT_SYSTEM_PROMPT + "\n\n" + str(profile["prompt"]),
             enable_skill_writer=False,
+            # A child shares the parent's browser/desktop, so use the same
+            # revalidation guard; the scoped registry still limits what it can
+            # execute and every call keeps the parent permission gate.
+            batch_guard=getattr(self.agent, "_guard_batch", None),
         )
 
     # ------------------------------------------------------------------ history

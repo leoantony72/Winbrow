@@ -13,6 +13,12 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+from .safe_paths import (
+    explicit_path,
+    remap_project_user_folder,
+    write_refusal,
+)
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 DOC_EXTS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".txt", ".csv"}
 MAX_SCAN_ENTRIES = 400
@@ -224,27 +230,80 @@ _MAX_TEXT_CONTENT_CHARS = 200_000
 _TEXT_EXTENSIONS = r"\.(txt|md|log|csv|json|ps1|py|go|html|css|js|ini)$"
 
 
-def _text_target_folder(value: str) -> Path:
+_FOLDER_ALIASES = {
+    "desktop": "Desktop",
+    "documents": "Documents",
+    "document": "Documents",
+    "downloads": "Downloads",
+    "download": "Downloads",
+    "pictures": "Pictures",
+    "picture": "Pictures",
+    "images": "Pictures",
+    "videos": "Videos",
+    "video": "Videos",
+    "music": "Music",
+    "home": "",
+}
+
+
+def resolve_user_folder(value: str, default: str = "Desktop") -> Path:
+    """Resolve an alias, a relative subfolder, or any absolute path.
+
+    ``Desktop``/``Downloads``/``Documents``/``Pictures``/``Videos`` are aliases
+    under the user profile. Top-level aliases map to their user folder; bare
+    relative names resolve under ``default`` (Desktop for text, Pictures for
+    images) instead of the home root or the app's cwd. Explicit
+    absolute/UNC/``~`` paths are used verbatim.
+    """
     home = Path(user_home())
-    key = (value or "Desktop").strip().lower()
-    if key.startswith("download"):
-        return home / "Downloads"
-    if key.startswith("document"):
-        return home / "Documents"
-    if key.startswith(("picture", "image")):
-        return home / "Pictures"
-    if key.startswith("video"):
-        return home / "Videos"
-    return home / "Desktop"
+    raw = str(value or "").strip().strip('"').strip("'")
+    if not raw:
+        return home / default if default else home
+    direct = explicit_path(raw)
+    if direct is not None:
+        return remap_project_user_folder(direct)
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    parts = Path(expanded).parts
+    if not parts:
+        return home / default if default else home
+    key = str(parts[0]).lower().rstrip(":")
+    if key in _FOLDER_ALIASES:
+        base = home / _FOLDER_ALIASES[key] if _FOLDER_ALIASES[key] else home
+        return base.joinpath(*parts[1:])
+    return home / default / expanded if default else home / expanded
+
+
+def _text_target_folder(value: str) -> Path:
+    return resolve_user_folder(value, "Desktop")
 
 
 def write_named_text_file(args: dict, base_dir: Optional[Path] = None) -> dict[str, Any]:
-    """Create/overwrite a text file in a known folder without PowerShell."""
-    filename = str(args.get("filename") or "").strip().strip("\"'")
+    """Create/overwrite a text file in any non-system folder."""
+    raw_filename = str(args.get("filename") or "").strip().strip("\"'")
+    if not raw_filename:
+        return {"success": False, "output": "No filename provided."}
+
+    folder_arg = str(args.get("folder") or "").strip()
+    direct = explicit_path(raw_filename)
+    if direct is not None:
+        direct = remap_project_user_folder(direct)
+        folder = direct.parent
+        filename = direct.name
+    else:
+        if Path(raw_filename).name != raw_filename:
+            return {
+                "success": False,
+                "output": "Invalid filename: pass the complete path in 'filename' "
+                          "or put the folder in the 'folder' argument.",
+            }
+        filename = raw_filename
+        folder = (
+            Path(base_dir) if base_dir is not None
+            else _text_target_folder(folder_arg)
+        )
+
     if not filename:
         return {"success": False, "output": "No filename provided."}
-    if Path(filename).name != filename:
-        return {"success": False, "output": "Invalid filename: path separators are not allowed."}
     if not re.search(_TEXT_EXTENSIONS, filename, re.IGNORECASE):
         filename += ".txt"
 
@@ -255,11 +314,12 @@ def write_named_text_file(args: dict, base_dir: Optional[Path] = None) -> dict[s
             "output": f"Content too large ({len(content)} chars; max {_MAX_TEXT_CONTENT_CHARS}).",
         }
 
-    folder = Path(base_dir) if base_dir is not None else _text_target_folder(
-        str(args.get("folder") or "Desktop"))
+    path = folder / filename
+    refusal = write_refusal(path)
+    if refusal:
+        return {"success": False, "output": refusal}
     try:
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / filename
         if folder.resolve() not in path.resolve().parents:
             return {"success": False, "output": "Invalid filename: escapes the target folder."}
         path.write_text(content, encoding="utf-8", newline="\n")

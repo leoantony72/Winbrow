@@ -1,4 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root {
+  --ui-background: 40 33% 98%;
+  --ui-foreground: 150 10% 16%;
+  --ui-primary: 151 27% 30%;
+  --ui-border: 40 12% 87%;
   --bg: #f6f4ee;
   --bg-raised: #fffdf9;
   --panel: #ffffff;
@@ -1141,7 +1149,8 @@ button {
 }
 
 /* ------------------------------------------------------------------ server activity */
-.connection {
+.connection,
+.activity {
   display: flex;
   flex: 1;
   min-height: 0;
@@ -1360,6 +1369,97 @@ button {
   padding: 16px 8px;
   color: var(--text-dim);
   font-size: 11.5px;
+}
+
+.prompt-stack {
+  gap: 10px;
+}
+.prompt-group {
+  overflow: hidden;
+  border: 1px solid rgba(228, 223, 211, 0.8);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.52);
+}
+.prompt-group-open {
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow: 0 1px 2px rgba(29, 35, 42, 0.04);
+}
+.prompt-toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.prompt-toggle:hover {
+  background: rgba(255, 255, 255, 0.55);
+}
+.prompt-toggle:focus-visible {
+  outline: 2px solid rgba(51, 112, 212, 0.35);
+  outline-offset: -2px;
+}
+.prompt-toggle .activity-dot {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+.prompt-head-main {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+.prompt-goal {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.prompt-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 9px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+.prompt-time {
+  color: var(--text-dim);
+}
+.prompt-status {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(29, 35, 42, 0.05);
+  color: var(--text-dim);
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.prompt-caret {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  transition: transform 0.18s ease;
+}
+.prompt-group-open .prompt-caret {
+  transform: rotate(180deg);
+}
+.prompt-log {
+  padding: 3px 6px 7px;
+  border-top: 1px solid rgba(228, 223, 211, 0.7);
+}
+.prompt-empty {
+  padding: 9px 10px;
+  color: var(--text-faint);
+  font-size: 11px;
 }
 
 .layout {
@@ -2316,4 +2416,86 @@ details[open] > summary .chev {
 .rail-del:hover {
   background: #fee2e2;
   color: #dc2626;
+}
+
+/* ---------------------------------------------------------------- copyable */
+/* Selection is enabled for content; chrome (buttons, timestamps, badges)
+   stays unselectable so click targets remain crisp. */
+html[data-win="dashboard"] body {
+  user-select: text;
+}
+.titlebar,
+button,
+.chip,
+.btn,
+.turn-user-badge,
+.turn-user-meta,
+.trace-time,
+.step-skill,
+.step-hint,
+.activity-time,
+.activity-kind,
+.activity-ms,
+.prompt-meta,
+.task-meta,
+.status-text {
+  user-select: none;
+}
+.trace-scroll,
+.trace,
+.thinking-body,
+.step-why,
+.step-output,
+.step-warning,
+.answer-body,
+.answer-sources,
+.clarify-question,
+.clarify-hint,
+.error-box,
+.prompt-log,
+.activity-main,
+.activity-title,
+.activity-detail,
+.activity-body,
+.connection-empty,
+.prompt-empty {
+  user-select: text;
+}
+.thinking summary .trace-copy {
+  margin-left: auto;
+}
+.prompt-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 10px;
+}
+.prompt-head .prompt-toggle {
+  flex: 1;
+  min-width: 0;
+  padding-right: 2px;
+}
+.prompt-copy {
+  flex: 0 0 auto;
+}
+.activity-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.activity-copy {
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.activity-row:hover .activity-copy,
+.activity-row.activity-open .activity-copy,
+.activity-copy:focus-visible {
+  opacity: 1;
+}
+.turn-copy {
+  flex: 0 0 auto;
+}
+.island-answer {
+  user-select: text;
 }

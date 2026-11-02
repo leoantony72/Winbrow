@@ -52,13 +52,21 @@ def fail(message: str, **extra: Any) -> None:
 
 
 def resolve_path(value: str | Path, *, default_dir: Path | None = None) -> Path:
+    from winbrow.safe_paths import USER_FOLDER_NAMES, remap_project_user_folder
+
     raw = os.path.expandvars(os.path.expanduser(str(value or "").strip()))
     if not raw:
         fail("A file path is required.")
-    path = Path(raw)
-    if not path.is_absolute() and default_dir is not None:
-        path = default_dir / path
-    return path.resolve()
+    normalized = raw.replace("\\", os.sep) if os.sep != "\\" else raw
+    path = Path(normalized)
+    if not path.is_absolute():
+        first = str(path.parts[0]).lower() if path.parts else ""
+        # "Desktop<sep>deck" means the user's Desktop, not the process cwd.
+        if first in USER_FOLDER_NAMES:
+            path = Path.home() / path
+        elif default_dir is not None:
+            path = default_dir / path
+    return remap_project_user_folder(path).resolve()
 
 
 def read_text_arg(spec: dict[str, Any], key: str = "content") -> str:

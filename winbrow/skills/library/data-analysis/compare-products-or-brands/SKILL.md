@@ -1,27 +1,14 @@
 ---
-name: "compare-products-or-brands"
-skill: "compare_products_or_brands"
-args:
-  - name: "entity_a"
-    type: "string"
-    required: true
-    default: null
-    description: "The first product, brand, or model to compare."
-  - name: "entity_b"
-    type: "string"
-    required: true
-    default: null
-    description: "The second product, brand, or model to compare."
-  - name: "focus"
-    type: "string"
-    required: false
-    default: null
-    description: "Specific aspects to compare, e.g., 'specs, price, battery life'. If omitted, a general comparison is performed."
+name: compare-products-or-brands
+skill: playbook_compare_products_or_brands
+kind: playbook
+category: data-analysis
+args: []
 description: >
-  Use this skill to compare two products, brands, or models by searching for
-  comparison articles and extracting key specifications, prices, and reviews.
-  Provide the two entities to compare and optionally the aspects to focus on.
-  This skill is not for comparing documents or PDFs.
+  Use this skill to compare two products, brands, or models by searching
+  for comparison articles and extracting key specifications, prices, and
+  reviews. Provide the two entities to compare and optionally the aspects
+  to focus on. This skill is not for comparing documents or PDFs.
 ---
 
 ## When to Use

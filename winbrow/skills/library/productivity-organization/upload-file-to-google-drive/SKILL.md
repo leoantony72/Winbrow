@@ -1,21 +1,13 @@
 ---
-name: "upload-file-to-google-drive"
-skill: "upload_file_to_google_drive"
-args:
-  - name: "file_path"
-    type: "string"
-    required: true
-    default: null
-    description: "Absolute path to the local file to upload."
-  - name: "destination_folder"
-    type: "string"
-    required: false
-    default: null
-    description: "Google Drive folder name or path to upload into; if omitted, upload to My Drive root."
+name: upload-file-to-google-drive
+skill: playbook_upload_file_to_google_drive
+kind: playbook
+category: productivity-organization
+args: []
 description: >
   Uploads a local file to Google Drive. Use when the user asks to upload a
-  file from their computer to Google Drive. Do not use for uploading to other
-  cloud services or for downloading files from Drive.
+  file from their computer to Google Drive. Do not use for uploading to
+  other cloud services or for downloading files from Drive.
 ---
 
 ## When to Use

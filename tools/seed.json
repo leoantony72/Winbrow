@@ -309,7 +309,7 @@
   },
   {
     "name": "find_files",
-    "description": "Search for files by name pattern on the user's common folders (Desktop, Documents, Downloads).",
+    "description": "Find files AND folders by name with Everything (es.exe) across all indexed drives. This is the only file/folder search backend; never scan Desktop, Documents, Downloads, Pictures or use Windows Search. Folder matches are returned as [folder] paths. Use it for every name lookup, including 'find the X folder'.",
     "examples": [
       "find files named report",
       "search for .pdf files",
@@ -325,7 +325,7 @@
         "default": "*"
       }
     ],
-    "script": "\n            $term = \"{{search_term}}\".Trim().Trim('\"').Trim(\"'\")\n            if (-not $term) { return \"No search term provided\" }\n            # Fuzzy identity: ignore spaces, underscores and hyphens so\n            # \"LDMseminar\" matches \"LDM seminar.pptx\" and \"ldm_seminar\".\n            $norm = ($term -replace '[\\s_\\-]+', '').ToLower()\n            if (-not $norm) { $norm = '__no_match__' }\n            $folders = @(\n                [Environment]::GetFolderPath('Desktop'),\n                [Environment]::GetFolderPath('MyDocuments'),\n                (Join-Path $env:USERPROFILE 'Downloads'),\n                (Join-Path $env:USERPROFILE 'Pictures')\n            )\n            $results = @()\n            foreach ($dir in $folders) {\n                if (-not (Test-Path $dir)) { continue }\n                $hits = Get-ChildItem -Path $dir -Recurse -File -Force -Depth 4 -ErrorAction SilentlyContinue |\n                    Where-Object {\n                        $_.Name -like \"*$term*\" -or\n                        ((($_.BaseName -replace '[\\s_\\-]+', '').ToLower()).Contains($norm))\n                    } | Select-Object -First 15\n                foreach ($hit in $hits) {\n                    $results += \"$($hit.FullName)  ($([math]::Round($hit.Length / 1KB, 1)) KB)\"\n                }\n            }\n            if ($results.Count -gt 0) {\n                return \"Found $($results.Count) file(s) matching '$term':`n\" + ($results | Select-Object -First 20 | Out-String)\n            } else {\n                return \"No files found matching '$term' in Desktop, Documents, Downloads, or Pictures. Ask the user for the location instead of scanning drives.\"\n            }\n            ",
+    "script": "\n$term = '{{search_term}}'.Trim().Trim('\"').Trim(\"'\")\n$noTerm = $false\nif (-not $term) {\n    $term = \"__winbrow_no_search_term__\"\n    $noTerm = $true\n}\n$limit = 20\n$results = @()\n$seen = @{}\n$source = \"Everything\"\n$esSeen = $false\n$esQueryOk = $false\n\n# Everything CLI (es.exe) is the only file/folder search backend.\n$esCandidates = @()\nif ($env:WINBROW_EVERYTHING_DIR) { $esCandidates += (Join-Path $env:WINBROW_EVERYTHING_DIR 'es.exe') }\nif ($env:LOCALAPPDATA) { $esCandidates += (Join-Path $env:LOCALAPPDATA 'WinBrow\\Everything\\es.exe') }\n$esCmd = Get-Command es.exe -ErrorAction SilentlyContinue\nif ($esCmd -and $esCmd.Source) { $esCandidates += $esCmd.Source }\nif ($env:ProgramFiles) { $esCandidates += (Join-Path $env:ProgramFiles 'Everything\\es.exe') }\nif (${env:ProgramFiles(x86)}) { $esCandidates += (Join-Path ${env:ProgramFiles(x86)} 'Everything\\es.exe') }\nif ($env:LOCALAPPDATA) { $esCandidates += (Join-Path $env:LOCALAPPDATA 'Programs\\Everything\\es.exe') }\nif ($env:ProgramW6432) { $esCandidates += (Join-Path $env:ProgramW6432 'Everything\\es.exe') }\n\n# Start the portable WinBrow index if its instance is not already running.\n$appLocalDirs = @()\nif ($env:WINBROW_EVERYTHING_DIR) { $appLocalDirs += $env:WINBROW_EVERYTHING_DIR }\nif ($env:LOCALAPPDATA) { $appLocalDirs += (Join-Path $env:LOCALAPPDATA 'WinBrow\\Everything') }\nforeach ($dir in ($appLocalDirs | Where-Object { $_ } | Select-Object -Unique)) {\n    $exe = Join-Path $dir 'Everything.exe'\n    $cli = Join-Path $dir 'es.exe'\n    if (-not (Test-Path -LiteralPath $exe) -or -not (Test-Path -LiteralPath $cli)) { continue }\n    & $cli -instance WinBrow -get-everything-version *> $null\n    if ($LASTEXITCODE -ne 0) {\n        try {\n            Start-Process -FilePath $exe -ArgumentList @('-instance', 'WinBrow', '-startup', '-config', (Join-Path $dir 'Everything.ini')) -WorkingDirectory $dir -WindowStyle Hidden -ErrorAction Stop\n            Start-Sleep -Milliseconds 500\n        } catch {\n            # Everything could not be started; report it below.\n        }\n    }\n}\n\nforeach ($es in ($esCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)) {\n    $esSeen = $true\n    $esArgs = @()\n    $isAppLocal = $false\n    if ($env:WINBROW_EVERYTHING_DIR -and $es -eq (Join-Path $env:WINBROW_EVERYTHING_DIR 'es.exe')) { $isAppLocal = $true }\n    if ($env:LOCALAPPDATA -and $es -eq (Join-Path $env:LOCALAPPDATA 'WinBrow\\Everything\\es.exe')) { $isAppLocal = $true }\n    if ($isAppLocal) { $esArgs = @('-instance', 'WinBrow') }\n\n    # Folders first, then files. No -i: ES defaults to case-insensitive; -i\n    # would force match-case and hide files like KAITHI_2019 when the user\n    # types \"kaithi\". Export to UTF-8 JSON so paths with non-ASCII characters\n    # (NBSP in KAITHI_2019_Tamil Proper...) are not mangled by console decoding.\n    foreach ($mode in @('/ad', '/a-d')) {\n        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('winbrow_es_' + [guid]::NewGuid().ToString('N') + '.json')\n        try {\n            & $es @esArgs -timeout 5000 -n $limit $mode -export-json $tmp -utf8-bom $term 2>$null | Out-Null\n            if ($LASTEXITCODE -eq 0) { $esQueryOk = $true }\n            if (Test-Path -LiteralPath $tmp) {\n                $text = [System.IO.File]::ReadAllText($tmp, [System.Text.Encoding]::UTF8)\n                $text = $text.TrimStart([char]0xFEFF)\n                if ($text.Trim()) {\n                    $parsed = $text | ConvertFrom-Json\n                    foreach ($entry in $parsed) {\n                        $p = ([string]$entry.filename).Trim()\n                        if (-not $p) { continue }\n                        if (-not $seen.ContainsKey($p) -and (Test-Path -LiteralPath $p)) {\n                            $seen[$p] = $true\n                            $results += [pscustomobject]@{ Path = $p; IsDir = ($mode -eq '/ad') }\n                        }\n                        if ($results.Count -ge $limit) { break }\n                    }\n                }\n            }\n        } catch {\n            # This Everything instance is not running or the CLI failed.\n        } finally {\n            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue\n        }\n        if ($results.Count -ge $limit) { break }\n    }\n\n    # A successful ES query is authoritative; do not try other installs.\n    if ($esQueryOk) { break }\n}\n\nif ($noTerm) {\n    return \"No search term provided\"\n} elseif ($results.Count -gt 0) {\n    $lines = $results | ForEach-Object {\n        if ($_.IsDir) {\n            \"[folder] $($_.Path)\"\n        } else {\n            $item = Get-Item -LiteralPath $_.Path -ErrorAction SilentlyContinue\n            if ($item) { \"$($_.Path)  ($([math]::Round($item.Length / 1KB, 1)) KB)\" } else { $_.Path }\n        }\n    }\n    return \"Found $($results.Count) item(s) matching '$term' in \" + $source + \":`n\" + ($lines -join \"`n\")\n} elseif (-not $esSeen) {\n    return \"No matches for '$term'. Everything (es.exe) is not installed; restart WinBrow so it can install and start Everything, or provide the full path.\"\n} elseif (-not $esQueryOk) {\n    return \"No matches for '$term'. Everything (es.exe) is installed but its index is not running or ready yet; wait a minute and retry, or provide the full path.\"\n} else {\n    return \"No matches for '$term' in the Everything index across all indexed drives. Everything may still be building its first index; retry in a minute or provide the full path.\"\n}\n",
     "speak": "done"
   },
   {
@@ -727,7 +727,7 @@
         "default": "desktop"
       }
     ],
-    "script": "\n            $loc = \"{{location}}\".Trim().ToLower()\n            $dest = [Environment]::GetFolderPath('Desktop')\n            if ($loc -match \"download\") { $dest = Join-Path $env:USERPROFILE \"Downloads\" }\n            elseif ($loc -match \"document\") { $dest = [Environment]::GetFolderPath('MyDocuments') }\n            elseif ($loc -match \"picture|photo|image\") { $dest = [Environment]::GetFolderPath('MyPictures') }\n            if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }\n            Add-Type -AssemblyName System.Windows.Forms,System.Drawing\n            $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds\n            $bmp = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height)\n            $g = [System.Drawing.Graphics]::FromImage($bmp)\n            $g.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)\n            $path = Join-Path $dest (\"screenshot_\" + (Get-Date -Format 'yyyyMMdd_HHmmss') + \".png\")\n            $bmp.Save($path); $g.Dispose(); $bmp.Dispose()\n            return \"Screenshot saved to $path\"\n            ",
+    "script": "\n            $raw = \"{{location}}\".Trim().Trim('\"').Trim(\"'\")\n            $loc = $raw.ToLower()\n            $dest = [Environment]::GetFolderPath('Desktop')\n            if ([System.IO.Path]::IsPathRooted($raw)) { $dest = $raw }\n            elseif ($loc -match \"download\") { $dest = Join-Path $env:USERPROFILE \"Downloads\" }\n            elseif ($loc -match \"document\") { $dest = [Environment]::GetFolderPath('MyDocuments') }\n            elseif ($loc -match \"picture|photo|image\") { $dest = [Environment]::GetFolderPath('MyPictures') }\n            elseif ($raw) { $dest = Join-Path $env:USERPROFILE $raw }\n            $full = [System.IO.Path]::GetFullPath($dest)\n            foreach ($root in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData)) {\n                if ($root) {\n                    $r = [System.IO.Path]::GetFullPath($root)\n                    if ($full -eq $r -or $full.StartsWith($r + [System.IO.Path]::DirectorySeparatorChar)) {\n                        return \"ERROR: refusing to write inside the Windows system area\"\n                    }\n                }\n            }\n            if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }\n            Add-Type -AssemblyName System.Windows.Forms,System.Drawing\n            $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds\n            $bmp = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height)\n            $g = [System.Drawing.Graphics]::FromImage($bmp)\n            $g.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)\n            $path = Join-Path $dest (\"screenshot_\" + (Get-Date -Format 'yyyyMMdd_HHmmss') + \".png\")\n            $bmp.Save($path); $g.Dispose(); $bmp.Dispose()\n            return \"Screenshot saved to $path\"\n            ",
     "speak": "done"
   },
   {
@@ -779,7 +779,8 @@
         "kind": "text",
         "instructions": "File name or full path to open",
         "criteria": {},
-        "default": ""
+        "default": "",
+        "required": true
       },
       {
         "name": "app",
@@ -815,7 +816,7 @@
   },
   {
     "name": "create_text_file",
-    "description": "Create a named text file with content in a known user folder (Desktop, Documents, Downloads, Pictures, Videos).",
+    "description": "Create a named text file with content in any user-writable folder (Desktop, Documents, Downloads, Pictures, Videos, a relative subfolder, or an absolute path). Windows system folders are refused.",
     "examples": [
       "create a text file called logo.txt on the desktop",
       "write hello.txt in the downloads folder",
@@ -828,26 +829,22 @@
         "kind": "text",
         "instructions": "Name of the file to create, e.g. logo.txt",
         "criteria": {},
-        "default": "note.txt"
+        "default": "note.txt",
+        "required": true
       },
       {
         "name": "content",
         "kind": "text",
         "instructions": "Contents to write into the file",
         "criteria": {},
-        "default": ""
+        "default": "",
+        "required": true
       },
       {
         "name": "folder",
-        "kind": "enum",
-        "instructions": "Where should the file be created?",
-        "criteria": {
-          "Desktop": "the current user's Desktop",
-          "Documents": "the Documents library",
-          "Downloads": "the Downloads folder",
-          "Pictures": "the Pictures library",
-          "Videos": "the Videos library"
-        },
+        "kind": "text",
+        "instructions": "Desktop, Documents, Downloads, Pictures, Videos, or any absolute folder path (e.g. D:\\projects\\deck). Windows system folders are refused.",
+        "criteria": {},
         "default": "Desktop"
       }
     ],
@@ -856,7 +853,7 @@
   },
   {
     "name": "download_file",
-    "description": "Download a non-image file (PDF, DOCX, ZIP, CSV...) from a URL into a known user folder (Desktop, Documents, Downloads). For pictures use download_images instead.",
+    "description": "Download a non-image file (PDF, DOCX, ZIP, CSV...) from a URL into a user-writable folder: Desktop, Documents, Downloads, or any absolute path. Windows system folders are refused. For pictures use download_images instead.",
     "examples": [
       "download the attention is all you need paper and save it in the desktop folder",
       "download this pdf from the url into downloads",
@@ -880,17 +877,13 @@
       },
       {
         "name": "folder",
-        "kind": "enum",
-        "instructions": "Where to save the downloaded file.",
-        "criteria": {
-          "Desktop": "the current user's Desktop",
-          "Documents": "the Documents library",
-          "Downloads": "the Downloads folder"
-        },
+        "kind": "text",
+        "instructions": "Desktop, Documents, Downloads, or any absolute folder path (e.g. D:\\incoming). Windows system folders are refused.",
+        "criteria": {},
         "default": "Downloads"
       }
     ],
-    "script": "\n            $url = \"{{url}}\"\n            if ($url -notmatch '^https?://') { return \"ERROR: a direct file URL is required\" }\n            $name = \"{{filename}}\"\n            if (-not $name) { $name = [System.IO.Path]::GetFileName(([Uri]$url).LocalPath) }\n            $bad = [System.IO.Path]::GetFileName($name)\n            if ($bad -ne $name -or -not $name) { return \"ERROR: invalid filename\" }\n            $baseDir = switch (\"{{folder}}\".ToLower()) {\n                \"desktop\"  { [Environment]::GetFolderPath('Desktop') }\n                \"documents\" { [Environment]::GetFolderPath('MyDocuments') }\n                default    { Join-Path $env:USERPROFILE 'Downloads' }\n            }\n            $path = Join-Path $baseDir $name\n            Invoke-WebRequest -Uri $url -OutFile $path -UseBasicParsing -TimeoutSec 60\n            if (-not (Test-Path $path)) { return \"ERROR: download failed\" }\n            return \"Downloaded to: $path\"\n            ",
+    "script": "\n            $url = \"{{url}}\"\n            if ($url -notmatch '^https?://') { return \"ERROR: a direct file URL is required\" }\n            $name = \"{{filename}}\"\n            if (-not $name) { $name = [System.IO.Path]::GetFileName(([Uri]$url).LocalPath) }\n            $bad = [System.IO.Path]::GetFileName($name)\n            if ($bad -ne $name -or -not $name) { return \"ERROR: invalid filename\" }\n            $folder = \"{{folder}}\".Trim().Trim('\"').Trim(\"'\")\n            $baseDir = switch ($folder.ToLower()) {\n                \"desktop\"   { [Environment]::GetFolderPath('Desktop') }\n                \"documents\" { [Environment]::GetFolderPath('MyDocuments') }\n                \"downloads\" { Join-Path $env:USERPROFILE 'Downloads' }\n                default     { if (-not $folder) { Join-Path $env:USERPROFILE 'Downloads' } elseif ([System.IO.Path]::IsPathRooted($folder)) { $folder } else { Join-Path $env:USERPROFILE $folder } }\n            }\n            $full = [System.IO.Path]::GetFullPath($baseDir)\n            foreach ($root in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData)) {\n                if ($root) {\n                    $r = [System.IO.Path]::GetFullPath($root)\n                    if ($full -eq $r -or $full.StartsWith($r + [System.IO.Path]::DirectorySeparatorChar)) {\n                        return \"ERROR: refusing to write inside the Windows system area\"\n                    }\n                }\n            }\n            if (-not (Test-Path $baseDir)) { New-Item -ItemType Directory -Path $baseDir -Force | Out-Null }\n            $path = Join-Path $baseDir $name\n            Invoke-WebRequest -Uri $url -OutFile $path -UseBasicParsing -TimeoutSec 60\n            if (-not (Test-Path $path)) { return \"ERROR: download failed\" }\n            return \"Downloaded to: $path\"\n            ",
     "speak": "done"
   }
 ]

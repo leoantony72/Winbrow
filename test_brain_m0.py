@@ -505,21 +505,36 @@ class TestMemoryStore(unittest.TestCase):
 
 
 class _FakeRegistry:
-    """Minimal registry stub for the brain loop."""
+    """Minimal registry stub for the brain loop.
+
+    Batch preflight needs reviewed ``Tool`` records; bare ``object()`` stubs are
+    still valid singletons but cannot prove eligibility for a multi-action batch.
+    """
     _tools = {
         "volume_set_level": ("Set master volume", {"level": "text"}),
         "app_focus_or_launch": ("Launch or focus app", {"app_name": "text"}),
         "window_action": ("Window min/max/close", {"action": "text"}),
     }
 
+    def __init__(self):
+        from winbrow.registry import ArgSpec, Tool
+
+        self._records = {
+            name: Tool(
+                name=name,
+                description=description,
+                script="",
+                impl=None,
+                args=[ArgSpec(arg, kind, "", default="") for arg, kind in args.items()],
+            )
+            for name, (description, args) in self._tools.items()
+        }
+
     def available(self, ctx):
-        return [type("T", (), {"name": n, "description": d,
-                               "args": [type("A", (), {"name": a, "kind": k})()
-                                         for a, k in args.items()]})()
-                for n, (d, args) in self._tools.items()]
+        return list(self._records.values())
 
     def get(self, name):
-        return object() if name in self._tools else None
+        return self._records.get(name)
 
 
 class _FakeCtx:
@@ -552,6 +567,13 @@ class TestAgentBrain(unittest.TestCase):
             ], response="Opened notepad and set volume."),
         ]
         brain = self._brain(FakeGateway(gw_responses), executed)
+
+        async def allow_guard(steps, state, completed_skill=""):
+            return {"success": True, "state": state}
+
+        # The loop mechanics are under test here; window-state guarding has its
+        # own tests. Desktop batches otherwise stay single-action by contract.
+        brain.batch_guard = allow_guard
         res = run(brain.handle("open notepad and set volume", _FakeCtx(), _FakeSession()))
         self.assertEqual(res.kind, "action")
         self.assertTrue(res.success)
@@ -657,10 +679,23 @@ class TestAgentBrain(unittest.TestCase):
     def test_max_steps_cap(self):
         brain = self._brain(None)
         brain.max_steps = 2
-        steps = [{"skill": "volume_set_level", "args": {"level": str(i)}} for i in range(10)]
+        steps = [{"skill": "volume_set_level", "args": {"level": str(i)}} for i in range(2)]
         brain.gateway._responses = [plan("action", steps=steps)]
         res = run(brain.handle("do many things", _FakeCtx(), _FakeSession()))
         self.assertLessEqual(len(res.steps), 2)
+
+    def test_oversized_batch_is_rejected_not_clipped(self):
+        brain = self._brain(None)
+        steps = [{"skill": "volume_set_level", "args": {"level": str(i)}} for i in range(10)]
+        # The planner gets one corrective turn after a rejected proposal.
+        brain.gateway._responses = [
+            plan("action", steps=steps),
+            plan("action", steps=steps),
+        ]
+        res = run(brain.handle("do many things", _FakeCtx(), _FakeSession()))
+        self.assertEqual(len(res.steps), 0)
+        self.assertFalse(res.success)
+        self.assertIn("exceeds per-turn cap", res.response)
 
 
 class TestAgentIntegration(unittest.TestCase):

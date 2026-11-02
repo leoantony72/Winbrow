@@ -1,14 +1,17 @@
 ---
 knowledge: 04-request-data-flow
-last_verified: 2026-10-25
+last_verified: 2026-11-01
 source_files:
   - winbrow/agent.py
   - winbrow/web_tools.py
   - winbrow/router.py
   - winbrow/brain/agent_loop.py
+  - winbrow/brain/batching.py
   - winbrow/brain/model_gateway.py
   - winbrow/brain/prompt.py
   - winbrow/brain/normalize.py
+  - winbrow/browser_task.py
+  - winbrow/execution.py
   - winbrow/utils/history.py
   - winbrow/permissions.py
   - winbrow/memory/session.py
@@ -19,7 +22,11 @@ source_files:
 
 # 04 — Request Data Flow
 
-Verified 2026-10-25. Entry point: `WinBrowAgent.execute()` (`winbrow/agent.py:1033`).
+Original snapshot verified 2026-10-25. Planner/schema, bounded batch execution, tool
+contracts, permission continuation, gateway JSON mode and history constants rechecked
+2026-11-01; other sections retain their original verification scope and historical line
+anchors. Entry point: `WinBrowAgent.execute()` in `winbrow/agent.py`; it now acquires the
+shared execution lease before `_execute_turn()`.
 
 ## 1. End-to-end sequence
 
@@ -50,9 +57,11 @@ WinBrowAgent.execute()
 ### 2.1 Pending permission replies
 
 If the whole utterance is yes/approve/confirm/allow/proceed/go ahead/do it/sure/yep/ok do it/accept,
-the most recent pending action is approved, consumed, and its original utterance is re-executed.
-`remember=True` only for T2. No/cancel/deny/reject/don't do it/dont denies and returns a `stop`
-result. This runs before the brain.
+the most recent pending action in the session is resolved through `confirm_pending()`. A brain
+cursor resumes only the unexecuted suffix under a fresh shared-state lease; a legacy non-brain
+pending re-runs its single cached action. `remember=True` only for T2. No/cancel/deny/reject/
+don't do it/dont denies, discards the cursor and returns a `stop` result. This runs before the
+brain.
 
 ### 2.2 Brain first
 
@@ -174,12 +183,12 @@ web_fetch if read/fetch verb) → NEW_ACTION.
 
 Tiers (`permissions.py:10-14`):
 
-| Tier | Meaning | Behavior |
-|---|---|---|
-| T0 | Read/sense | Auto-allow |
-| T1 | Reversible action | Auto-allow |
-| T2 | User-data write / risky | Confirm once, remember the exact action key |
-| T3 | System/install/destructive | Confirm every time; never remembered |
+| Tier | Meaning                    | Behavior                                    |
+| ---- | -------------------------- | ------------------------------------------- |
+| T0   | Read/sense                 | Auto-allow                                  |
+| T1   | Reversible action          | Auto-allow                                  |
+| T2   | User-data write / risky    | Confirm once, remember the exact action key |
+| T3   | System/install/destructive | Confirm every time; never remembered        |
 
 Classification:
 
@@ -192,12 +201,19 @@ Classification:
 - Learned tools are floored at T2 (`permissions.py:221-224`).
 - `WINBROW_BYPASS_CONFIRM=1` bypasses everything, including T3.
 - `WINBROW_AUTO_APPROVE_T2=1` auto-remembers T2.
-- Pending TTL is 900 s; TTL pruning runs on new pending/pending_list.
-- Confirmation channels: in-process `set_confirm_fn` (voice) or `POST /api/confirm`
-  (`server.py:548`).
+- Pending TTL is 900 s; TTL pruning now runs on every pending lookup/resolve.
+- Confirmation channels: in-process `set_confirm_fn` (voice), `POST /api/confirm`,
+  the WebSocket confirm action, or chat "yes/no"; all feed `confirm_pending()`.
+- An exact pending confirmation is authoritative. The gate consumes an approved
+  record before dispatch, so it cannot authorize a second identical call.
+  `permission_scope()` supplies utterance/session/confirmation context to
+  executors that call the gate with defaults; unrelated calls and replayed IDs
+  fail closed.
 
-`action_key()` hashes `(tool, normalized args)`; each arg is lowercased/truncated to 160 chars
-(`permissions.py:112`), which can collide for long args sharing a prefix (I-01 in `05`).
+`action_key()` hashes the full case-sensitive JSON `[tool, args]` as a `v2:`
+SHA-256 digest (nested values included; no lowercasing/truncation). This is an
+intentional break from old remembered grants, which cannot be reconstructed
+safely; previously remembered T2 entries are ignored and must be approved again.
 
 ## 4. Tool dispatch (`run_skill`, `agent.py:346-526`)
 
@@ -206,6 +222,17 @@ Classification:
 3. Permission gate.
 4. Special cases: `create_text_file` (`files.write_named_text_file`), `volume_set_level`,
    `laya_ultrafast_browser`, `app_focus_or_launch`, `type_text`.
+   Write tools accept a friendly folder alias, a relative subfolder under the
+   profile, or any absolute path; `winbrow/safe_paths.py` refuses Windows,
+   Program Files, ProgramData and other OS-owned trees. `download_file` and
+   `take_screenshot` repeat that guard inside their PowerShell scripts.
+   Deliverables default to Desktop. `winbrow/safe_paths.remap_project_user_folder`
+   converts accidental project-local `Desktop\…`/`Documents\…` paths to the real
+   user profile; ordinary project paths are untouched. Skill-script subprocesses
+   run with `cwd=Path.home()` (not the source tree), and
+   `skill_script_utils.resolve_path` maps relative `Desktop\…`/`Downloads\…`
+   paths to the user profile. `WINDOWS CONTEXT` now lists the exact Desktop,
+   Documents, Downloads, Pictures and Videos paths for the planner.
 5. `impl` dispatch:
    - `COMPUTER_IMPL` → async override map or `execute_computer_tool`; OCR goes through
      `asyncio.to_thread`.
@@ -225,45 +252,102 @@ All impls return a dict with at least `success` and `output`; the dispatcher add
 
 ## 5. Brain loop (`brain/agent_loop.py`)
 
-`AgentBrain.handle(utterance, ctx, session, emit=None)` (`:543`):
+`AgentBrain.handle(utterance, ctx, session, emit=None, max_steps=None, _resume=None)`:
 
-1. Build system prompt (`SYSTEM_PROMPT_STATIC` + metadata) and user message with context, session
-   block, and history.
-2. Call the gateway with the planner JSON schema.
-3. Parse one of: `action`, `done`, `chat`, `clarify`.
-4. `action`: extract steps, inject `SKILL DETAIL` for the chosen skill, execute the first step with
-   `_run_step()` (`:1048`), append a `BrainStepResult`, loop.
-5. `done`: run `_completion_gap()`; if there is a gap, challenge once ("verify"), otherwise return
-   success and fire the skill writer.
-6. `clarify`: if `ask_user_fn` exists, ask and append the reply (max 3 rounds); otherwise return
-   `needs_input=True`.
-7. Stop at `max_steps` (default 20), with a warning when `step_warn_remaining` (default 5) remain.
+1. Build system prompt (`SYSTEM_PROMPT_STATIC` + metadata + BATCH TOOL CONTRACTS) and user
+   message with context, session block, history and the live per-turn action cap.
+2. Call the gateway with the planner JSON schema. A response may carry one `step` or a bounded
+   `steps[]`; both together, an empty array, unknown tools and malformed args are rejected.
+3. Parse one of: `action`, `done`, `chat`, `clarify`, `stop`.
+4. `action`: resolve every skill key, then call `validate_steps()` on the **complete array**
+   before any side effect. It checks shape, required args/defaults/enums, JSON safety,
+   unresolved result references, unknown/duplicate non-read mutations, subagent scope,
+   `WINBROW_MAX_ACTIONS_PER_TURN` (default 5, clamp 1–10) and the remaining action budget.
+   Arrays are never clipped; a rejected proposal gets a corrective planning turn that also
+   injects the failing tool's schema. Optional `null` means "omitted", a one-item array is
+   unwrapped for scalar text/enum/package args, and object specs are valid for
+   `run_skill_script.spec` (kind `json`). Optional enum defaults are accepted
+   (`web_search.freshness=""` means no filter); reviewed aliases are normalized
+   (`today`/`recent` → `day`/`week`, installer `app`/`app_name`/`id` → `package`); enum
+   spelling variants (quotes, case, `the … folder`, an absolute path ending in a choice) are
+   resolved, while unknown values and absolute *subfolders* still fail closed. Argument
+   rejections keep exact step/skill/value detail and allow a third preflight attempt;
+   structural rejections still stop after two. The trace's `brain_batch_rejected` event
+   includes a bounded, secret-redacted step preview.
+5. Execute the validated members in order through `_run_step()` → `run_skill()`; every member
+   keeps the normal permission gate, timeout, history entry and one action-budget charge.
+   Sequential is the default, including known-input read-after-write and mixed tools. The
+   existing `WINBROW_PARALLEL_READS=1` path (default off) still concurrency-runs only distinct,
+   not-already-successful calls whose reviewed policy is parallel-safe. Browser mutations and
+   desktop work never use that path.
+6. Batch eligibility is backend-owned (`brain/batching.py`): reviewed `BatchPolicy` records
+   keyed by exact tool name + dispatcher impl carry `ordered`, `parallel`, `barrier_after`,
+   `resource` and a reason. Unknown/learned/script/MCP/shell/meta tools are singleton barriers;
+   a model-supplied `parallel` flag grants nothing. A `barrier_after` member (navigation,
+   upload, Enter/uncertain hotkey, natural-language interact, dialog-prone adapter) ends the
+   sequence and queues the rest for replanning.
+7. Browser batches are pinned to the remembered agent tab + document token
+   (`BrowserController.batch_state()`) and revalidated by `WinBrowAgent._guard_batch()` before
+   the batch and after each successful member. Navigation, same-URL reload, replaced or
+   ambiguous targets, invisible/disabled targets and missing state stop the queue. Desktop
+   has no reviewed window-state guard yet, so a desktop batch returns a replan boundary and is
+   executed as single actions instead of mutating blindly. Other domains are sequential and
+   rely on each tool's own result/verification.
+8. A permission-required member saves the immutable unexecuted suffix, normalized args,
+   completed history, run/step budget, guard state and session ID under the confirmation ID.
+   `resume_pending()` revalidates id/session/tool/args and resumes only that suffix; the
+   approved gate record is consumed before dispatch. Denial, expiry, a session/target/argument
+   change or lost state discards the cursor and reports recovery-required rather than replaying
+   completed work. `WinBrowAgent.confirm_pending()` holds the shared execution lease while
+   resuming; `execute()` holds it for normal goals so separate requests cannot interleave UI
+   mutations.
+9. Ordinary failure, timeout, uncertainty or cancellation stops the remaining queued members
+   and replans; precomputed read batches already ran, so their remaining results are recorded.
+   `BrainResult.batches` reports batch ID, planned/attempted counts, unexecuted members and the
+   stop reason. Unexpected results are never described as rolled back.
+10. `done`: run `_completion_gap()`; if there is a gap, challenge once ("verify"), otherwise
+    return success and fire the skill writer. This is heuristic, not a generic postcondition
+    verifier.
+11. `clarify`: if `ask_user_fn` exists, ask and append the reply (max 3 rounds); otherwise
+    return `needs_input=True`.
+12. Stop at `max_steps` (default 20), with a warning when `step_warn_remaining` (default 5)
+    remain.
 
-`_run_step()`:
+`_run_step()` emits per-tool progress events and calls `_run_step_inner()`:
 
-- `await asyncio.wait_for(executor(skill, args), timeout=STEP_TIMEOUT_S)` (default 120 s).
-- Unknown skill/timeout become failed `BrainStepResult`s with a warning, not exceptions.
-- `annotate_result()` (`:1292`) adds navigation mismatch warnings, truncation warnings for browser
-  trees, and repair hints.
+- Registered executable tools use `await asyncio.wait_for(executor(skill, args),
+timeout=STEP_TIMEOUT_S)` (default 120 s); the agent supplies the `run_skill()` executor.
+- Unknown skill/timeout become failed `BrainStepResult`s, not exceptions across the boundary.
+- `annotate_result()` adds navigation mismatch warnings, truncation warnings for browser trees,
+  and repair hints. Built-in memory/meta/playbook branches are handled separately.
+
+Design record and remaining barriers: `BRAIN_BATCHING_PLAN.md` (2026-11-01; Phases 0–2
+implemented). Browser snapshots deliberately omit checked state and generic clicks are not
+idempotent, so a desired-state checkbox primitive, reviewed desktop window guard, result
+bindings and reviewed MCP/API contracts remain Phase 3+ work. Until then those operations stay
+singletons or observation barriers; they are not silently batched.
 
 `BrainResult.to_dict()` is the `execution` payload; `BrainStepResult` carries `skill`, `args`,
 `success`, `output`, `warning`, `url`, `title`, `elapsed_ms`.
 
 ## 6. History and compression (`utils/history.py`)
 
-| Constant | Value | Meaning |
-|---|---|---|
-| `FULL_WINDOW` | 5 | Last 5 steps rendered in full |
-| `RECENT_OUTPUT_LIMIT` | 400 | Output cap for non-browser recent steps |
-| `BROWSER_DETAIL_STEPS` | 3 | Last 3 browser steps get detailed page text |
-| `PAGE_TEXT_LIMIT_CURRENT` | 3000 | Current browser step page text |
-| `PAGE_TEXT_LIMIT_RECENT` | 2000 | Previous detailed browser steps |
-| `DOCUMENT_STEP_LIMIT` | 30000 | Per-step document read budget |
-| `DOCUMENT_TOTAL_BUDGET` | 60000 | Total document budget across recent steps |
+| Constant                  | Value | Meaning                                                                     |
+| ------------------------- | ----- | --------------------------------------------------------------------------- |
+| `FULL_WINDOW`             | 5     | Last 5 steps rendered in full                                               |
+| `RECENT_OUTPUT_LIMIT`     | 4000  | Legacy recent-output cap; observations/web/documents have dedicated budgets |
+| `BROWSER_DETAIL_STEPS`    | 3     | Last 3 browser steps get detailed page text                                 |
+| `PAGE_TEXT_LIMIT_CURRENT` | 3000  | Current browser step page text                                              |
+| `PAGE_TEXT_LIMIT_RECENT`  | 2000  | Previous detailed browser steps                                             |
+| `DOCUMENT_STEP_LIMIT`     | 30000 | Per-step document read budget                                               |
+| `DOCUMENT_TOTAL_BUDGET`   | 60000 | Total document budget across recent steps                                   |
 
-Older steps are compressed to `skill → success output`; older browser steps become
-`url=… title=…`. `detect_stuck()` and `count_recent_stuck()` detect repeated identical actions and
-warning text so the loop can force a clarify instead of spinning.
+The loop now defaults to full-history rendering (`WINBROW_HISTORY_FULL=0` opts into the
+legacy compressed window). Full mode uses `HISTORY_KEEP_RECENT=5`, a 240,000-character default
+budget and a 400,000-character ceiling, with clipping/spill support. In legacy mode older
+steps are compressed to `skill → success output`; older browser steps become `url=… title=…`.
+`detect_stuck()` and `count_recent_stuck()` detect repeated identical actions and warning text
+so the loop can force a clarify instead of spinning.
 
 ## 7. Model gateway (`brain/model_gateway.py`)
 
@@ -278,7 +362,9 @@ warning text so the loop can force a clarify instead of spinning.
 - Reasoning config (`get_reasoning_config`, `:85`): default total 16000 / reasoning 2000; browser
   turns 8000 / 600.
 - Empty planner content retries with reasoning 400, then reasoning disabled at 1000 total.
-- JSON extraction (`extract_json_object`, `:358`) cleans code fences, finds balanced objects, and
+- Planner JSON uses `response_format=json_schema` with `strict=False`
+  (`model_gateway.py:898–902` as of 2026-11-01); local semantic/argument validation remains necessary.
+- JSON extraction (`extract_json_object`) cleans code fences, finds balanced objects, and
   repairs truncated JSON.
 - `GatewayUnavailable` means no provider; callers fall back to heuristics/generator.
 
@@ -301,14 +387,14 @@ available.
 
 ## 9. Memory flow
 
-| Layer | File | Scope |
-|---|---|---|
-| Session | `memory/session.py` (`tools/session_state.json`) | Turns, entities, clarifications; last 24 turns, 10 entities/kind, 5 sessions |
-| Episodic | `memory/store.py` (`data/memory.db`) | Commands, file/folder/app opens, facts, corrections; FTS5 + optional Chroma |
-| Replay | `memory/skills.py` (`tools/skills.json`) | Approved multi-step plans |
-| Recency | `last_opened.py` (`tools/context_memory.json`) | Last 3 opened files/folders/apps for "that file" |
-| Brain skills | `winbrow/skills/` | Markdown instructions |
-| Learned tools | `tools/learned.json` | Generated PowerShell tools |
+| Layer         | File                                             | Scope                                                                        |
+| ------------- | ------------------------------------------------ | ---------------------------------------------------------------------------- |
+| Session       | `memory/session.py` (`tools/session_state.json`) | Turns, entities, clarifications; last 24 turns, 10 entities/kind, 5 sessions |
+| Episodic      | `memory/store.py` (`data/memory.db`)             | Commands, file/folder/app opens, facts, corrections; FTS5 + optional Chroma  |
+| Replay        | `memory/skills.py` (`tools/skills.json`)         | Approved multi-step plans                                                    |
+| Recency       | `last_opened.py` (`tools/context_memory.json`)   | Last 3 opened files/folders/apps for "that file"                             |
+| Brain skills  | `winbrow/skills/`                                | Markdown instructions                                                        |
+| Learned tools | `tools/learned.json`                             | Generated PowerShell tools                                                   |
 
 `get_session(id)` constructs a fresh object and reloads JSON on every call; `get_store()` is a
 singleton. Chroma failures degrade to FTS/LIKE. FTS is write-only mirrored (no triggers).
@@ -345,13 +431,13 @@ should be returned as `success: False` with an `output` message, not raised acro
 
 ## 12. Where to change what
 
-| Change | Touch |
-|---|---|
-| New intent phrase | `router._heuristic_route()` + a test case |
-| New tool | `registry.Tool`, `get_*_tools()`, `run_skill` impl branch, `permissions.TOOL_TIERS`, `SKILL.md` |
-| New permission rule | `permissions.TOOL_TIERS` or `_default_tier`, and `policy.script_tier` if content-based |
-| New planner behavior | `brain/prompt.py` rules + `brain/agent_loop.py` parse/complete logic |
-| New browser primitive | `browser_tools.py` + `browser_task.py` + `SKILL.md` + `history.BROWSER_SKILLS` |
-| New memory type | `memory/store.py` schema + `record_*` + retrieval |
-| New provider | `brain/model_gateway._build_chain()` |
-| New app adapter | `adapters/<app>.py` `OPS` + manager import |
+| Change                | Touch                                                                                           |
+| --------------------- | ----------------------------------------------------------------------------------------------- |
+| New intent phrase     | `router._heuristic_route()` + a test case                                                       |
+| New tool              | `registry.Tool`, `get_*_tools()`, `run_skill` impl branch, `permissions.TOOL_TIERS`, `SKILL.md` |
+| New permission rule   | `permissions.TOOL_TIERS` or `_default_tier`, and `policy.script_tier` if content-based          |
+| New planner behavior  | `brain/prompt.py` rules + `brain/agent_loop.py` parse/complete logic                            |
+| New browser primitive | `browser_tools.py` + `browser_task.py` + `SKILL.md` + `history.BROWSER_SKILLS`                  |
+| New memory type       | `memory/store.py` schema + `record_*` + retrieval                                               |
+| New provider          | `brain/model_gateway._build_chain()`                                                            |
+| New app adapter       | `adapters/<app>.py` `OPS` + manager import                                                      |

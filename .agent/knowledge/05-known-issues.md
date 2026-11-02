@@ -1,6 +1,6 @@
 ---
 knowledge: 05-known-issues
-last_verified: 2026-10-25
+last_verified: 2026-11-01
 source_files:
   - winbrow/browser_task.py
   - winbrow/browser_tools.py
@@ -24,10 +24,11 @@ source_files:
 
 # 05 — Known Issues
 
-Verified 2026-10-25 by full-file reads. **58 issues** are recorded: 20 browser, 14 desktop,
-14 routing/generation, 10 IO/memory/voice. Severity is an engineering judgement, not a runtime
-test result. No tests were run for this document; every item was confirmed by reading the cited
-lines.
+Verified 2026-10-25 by full-file reads; I-01 and I-02 were removed 2026-11-01 after the
+guarded-batching implementation fixed them. **56 issues** are recorded: 20 browser, 14 desktop,
+14 routing/generation, 8 IO/memory/voice. Severity is an engineering judgement, not a runtime
+test result. The 2026-11-01 removal was verified with `winbrow/tests/test_permission_scopes.py`
+and `test_batch_execution.py`; the remaining rows were not re-run live.
 
 Fix hints assume you keep the current architecture. Do not "fix" an invariant listed in
 `01-system-architecture.md` or `02-browser-automation.md` without checking its callers.
@@ -95,12 +96,10 @@ Fix hints assume you keep the current architecture. Do not "fix" an invariant li
 | R-13 | Medium | Generator provider endpoints are mismatched/malformed | `generator.py:235`, `:256-261` (Ollama `/api/generate` called with OpenAI JSON); `:278-284` (Vertex host built from `projects/<id>`) | Ollama requests fail; Vertex URL is not a valid host. Use the right payload per endpoint and a real regional host. |
 | R-14 | Low | `NEW_ACTION_MIN_CONFIDENCE` is unused, and Laya tool choices in 0.35–0.60 are discarded | `router.py:35`, `:1025`, `:1129` | Confusing dead configuration; valid mid-confidence choices fall through. Remove or apply consistently. |
 
-## IO / memory / voice (I-01 … I-10)
+## IO / memory / voice (I-03 … I-10)
 
 | ID | Sev | Issue | Evidence | Impact / fix hint |
 |---|---|---|---|---|
-| I-01 | Medium | `action_key()` truncates every arg to 160 chars before hashing | `permissions.py:112` | Distinct long args sharing a prefix map to one remembered T2 approval. Hash the full value or a longer digest input. |
-| I-02 | Medium | An approved pending action can re-authorize identical calls indefinitely | `permissions.py:268-269`, `:293-297` | TTL pruning runs only on new-pending/pending_list. Consume or expire approvals deterministically. |
 | I-03 | Medium | MCP `env` is additive over the full parent environment | `mcp.py:147-150` | The header claims explicit-only passthrough, but secrets are inherited by every server. Build a minimal env allowlist. |
 | I-04 | Medium | `execute_mcp_tool()` always uses the default hub | `mcp.py:641-645`, `:796` | A hub built with a custom config path can connect but never execute. Pass the hub through or key calls by config. |
 | I-05 | Low | MCP tool-name collisions are silently skipped | `mcp.py:708`, `:756` | A server can shadow another server's tool with no warning. Log and namespace deterministically. |

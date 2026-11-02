@@ -15,10 +15,10 @@ args:
     default: 3
     description: How many images to download (1-10).
   - name: folder
-    type: enum
+    type: string
     required: false
     default: Pictures
-    description: "Where to save: Pictures, Downloads, Desktop, or Documents."
+    description: "Pictures, Downloads, Desktop, Documents, Videos, or any absolute folder path (e.g. D:\\projects\\deck\\assets). Windows system folders are refused."
   - name: source
     type: enum
     required: false
@@ -66,8 +66,9 @@ This is the general image path. The wallpaper tools (`set_wallpaper`,
 1. Turn the request into a short subject: drop filler such as "download",
    "some", "images", "pictures". "Download some pictures of a golden
    retriever" → `query="golden retriever"`.
-2. Pick `folder` from the sentence (Downloads/Desktop/Documents), else leave
-   the default Pictures.
+2. Pick `folder` from the sentence (Downloads/Desktop/Documents/Pictures/Videos)
+   or use the exact absolute folder the user named (e.g.
+   `D:\projects\deck\assets`); leave the default Pictures if no folder is given.
 3. Call `download_images(query, count, folder, source, min_width)`.
 4. Report the saved paths. If the task then needs the image (insert into a
    document, set as wallpaper, attach it), use the returned `files` paths.

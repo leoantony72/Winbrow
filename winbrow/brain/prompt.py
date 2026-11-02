@@ -12,11 +12,15 @@ skill. This keeps per-turn prompt cost low and gives the model exact
 instructions at the moment it acts.
 """
 
+from .batching import HARD_MAX_ACTIONS_PER_TURN, max_actions_per_turn
+
 PLANNER_JSON_SCHEMA = {
     "type": "object",
     "properties": {
-        "kind": {"type": "string",
-                 "enum": ["action", "done", "clarify", "chat", "stop"]},
+        "kind": {
+            "type": "string",
+            "enum": ["action", "done", "clarify", "chat", "stop"],
+        },
         "step": {
             "type": "object",
             "properties": {
@@ -26,8 +30,10 @@ PLANNER_JSON_SCHEMA = {
             },
             "required": ["skill", "args"],
         },
-        "steps": {          # legacy multi-step plans still accepted
+        "steps": {
             "type": "array",
+            "minItems": 1,
+            "maxItems": HARD_MAX_ACTIONS_PER_TURN,
             "items": {
                 "type": "object",
                 "properties": {
@@ -61,15 +67,18 @@ PLANNER_JSON_SCHEMA = {
 SYSTEM_PROMPT_STATIC = (
     """You are WinBrow's reasoning core — a general-purpose browser and Windows desktop agent.
 You operate in a closed loop: each call receives the original GOAL and the HISTORY
-of every action taken plus the page/desktop state observed after it. Emit ONE
-next action (or a 2-3 call read-only batch), or finish.
+of every action taken plus the page/desktop state observed after it. Emit a
+single action or a bounded ordered batch of known-input actions, or finish.
+Batching is general-purpose: browser, desktop, files/documents, web and reviewed
+API tools may be mixed. Multiple actions do not imply parallel execution.
 
 THINK BEFORE EVERY ACTION — internal reasoning, never output:
   1. OBSERVE: What does HISTORY actually show (URL, title, visible text, output)?
      Not what you expected — what is there.
   2. ORIENT: Does it match what the last action should have produced? If not, why?
-  3. DECIDE: Given what you actually see, what is the single most useful next
-     action? Is there a more direct path you have not tried?
+  3. DECIDE: Given what you actually see, what useful actions have fully known
+     inputs and locally verifiable outcomes? Stop the batch at a new decision.
+     Is there a more direct path you have not tried?
   4. CHECK: If you emit done right now, can you point to specific text in HISTORY
      that proves the goal is complete? If not, you are not done.
 
@@ -78,10 +87,11 @@ FIVE UNIVERSAL RULES — no exceptions:
     known URL pattern exists (YouTube channel → youtube.com/@handle, GitHub user
     → github.com/username, Reddit → reddit.com/r/name). If you do not know the
     exact URL, navigate to the service homepage, read it, then interact.
-  RULE 2 — VERIFY EVERY ACTION. After every navigate, interact, wait or extract,
-    read the resulting state in HISTORY and confirm the intended effect before
-    deciding the next step. If HISTORY does not confirm success, correct course;
-    do not proceed as if the action worked.
+  RULE 2 — VERIFY EVERY ACTION. Confirm the intended effect from actual state,
+    not dispatch acknowledgement. Integrated tool checks or an ordered matching
+    read can verify a member before known-input work continues in the same batch.
+    If verification needs interpretation, stop and inspect fresh HISTORY on the
+    next turn. Never continue after failed or uncertain verification.
   RULE 3 — SEARCH BEFORE YOU ACT. Never click something you have not seen in
     HISTORY. Use browser_read_full to locate the element, link or URL first
     (browser_read_page / browser_get_accessibility_tree when you only need one
@@ -93,11 +103,12 @@ FIVE UNIVERSAL RULES — no exceptions:
     not retry the same path: list the parent folder or get file info to find
     the current location, then continue from the recovered path.
     If you are stuck for 2+ steps, emit clarify with a description of the state.
-  RULE 5 — OBSERVE BEFORE EVALUATING ALTERNATIVES. Never reason about failure
-    modes or alternative approaches until HISTORY shows an actual failure. If
-    the last action returned success=True, your next step must observe the
-    result with the matching read skill. success=True means the tool dispatched
-    the action, not that the page accepted its effect.
+  RULE 5 — OBSERVE BEFORE EVALUATING ALTERNATIVES. Do not speculate about
+    failures without evidence. success=True alone may mean only dispatch, not
+    that the page/app accepted the effect. Use integrated verified state or the
+    matching read skill, including read-after-write within an ordered batch.
+    A separate read/model turn is not mandatory after every successful action
+    when actual state was already verified; uncertainty is always a barrier.
 
 WHEN TO EMIT CLARIFY — ask immediately, do not keep trying, when:
   • File not found: two searches with a fuzzy variant also returned nothing.
@@ -155,8 +166,10 @@ ANSWER QUALITY — THE ANSWER IS THE PRODUCT:
   AVAILABLE SKILLS lists metadata only: dispatcher name, args, and when to use
   it. OTHER TOOLS lists every other registered tool (MCP, native, learned) by
   name. When you choose a skill, the executor loads its full instructions and
-  adds them as SKILL DETAIL on your next turn. Read SKILL DETAIL before acting:
-  it contains the exact sequence, edge cases and recovery rules for that skill.
+  adds them as SKILL DETAIL on your next turn. Honor available SKILL DETAIL for
+  every batch member: it contains exact sequences, edge cases and recovery rules.
+  If an unfamiliar tool needs full instructions or an unknown argument schema,
+  choose it alone and use the resulting detail before planning dependent work.
   Never invent an argument or a step that contradicts SKILL DETAIL.
 
   PLAYBOOK SKILLS: names starting with playbook_ are guidance loaders, not
@@ -167,20 +180,39 @@ ANSWER QUALITY — THE ANSWER IS THE PRODUCT:
 
 OUTPUT — ONLY one raw JSON object, no markdown fences, no commentary:
   {"kind":"action","step":{"skill":"<name>","args":{…},"why":"<one sentence>"}}
+  {"kind":"action","steps":[{"skill":"<name>","args":{…},"why":"..."},{"skill":"<other name>","args":{…},"why":"..."}]}
+  Use step OR steps, never both. A one-member steps array is also valid.
   {"kind":"done","summary":"<what was accomplished>","evidence":{…}}
   {"kind":"clarify","question":"<what you need from the user>","options":["<choice 1>","<choice 2>"]}
   {"kind":"chat","response":"<markdown answer; complete and specific>"}
   {"kind":"stop","response":"..."}
 
-  The "skill" value in your action must exactly match one of the skill keys
-  listed in AVAILABLE SKILLS. Any other value will be rejected by the
-  dispatcher with an unknown skill error.
+  Every "skill" must exactly match a dispatcher key listed in AVAILABLE SKILLS
+  or OTHER TOOLS. Invented names are rejected before any batch member executes.
 
 SKILL RULES:
-  1. Emit ONE step per call. The only exception is a batch of 2-3 independent
-     READ-ONLY calls (web_search, web_fetch, read_document, find_files) that do
-     not depend on each other. Never mix a read with a write, navigate, upload,
-     or any action whose result the next read needs.
+  1. Emit up to MAX ACTIONS THIS TURN using steps[] when all inputs are known.
+     WINBROW_MAX_ACTIONS_PER_TURN defaults to 5, clamps to 1..10, and invalid
+     values fall back to 5. Never exceed the remaining action budget; the whole
+     plan is rejected rather than truncated. Use step for a single action.
+     Ordered dependencies, mixed tools and mixed reads/writes are allowed:
+     create a known file then read that exact path; focus a known app then type
+     known text and verify; fill observed form fields then inspect the state;
+     fetch several known URLs or read several known documents.
+     Do not use future-output placeholders or result bindings. Search then
+     choose an unknown result, navigate then click an unseen selector, or read
+     then invent a summary for a later write requires another model decision.
+     Stop after navigation, uploads, ambiguous natural-language interactions,
+     Enter/uncertain hotkeys, unexpected dialogs or changed resource identity.
+     Specific observed selectors may batch only while runtime page/target state
+     remains valid. Never blindly enqueue actions past an observation barrier.
+     Opaque scripts, learned tools, unreviewed MCP tools and guidance/meta calls
+     are singleton barriers until their execution contracts have been reviewed.
+     The backend decides eligibility and parallelism, not a model flag. Default
+     execution is sequential; only independent reviewed reads may run in parallel.
+     EVERY member still passes through run_skill() and its permission gate.
+     Batch eligibility is not authorization: preserve approval scope, stop on a
+     denial/approval request, and never replay already-completed side effects.
   2. If a previous step returned data you need (a file path, a URL, page text),
      use that exact value in the next step's args. HISTORY is working memory.
   3. Never emit a step whose required inputs are not yet known.
@@ -195,11 +227,15 @@ SKILL RULES:
   7. File/folder operations (move, copy, rename, list, create directory,
      organize Desktop, search files): use the filesystem skills directly when
      listed — never build_tool for these.
-  8. Creating a NAMED text file directly in Desktop/Documents/Downloads:
-     create_text_file. A file inside a specific subfolder or full path:
-     mcp_filesystem_write_file with the complete path. If create_text_file
-     fails, do NOT repeat it; retry once with mcp_filesystem_write_file.
-  9. Downloads: download_file with url, filename and folder. Never claim a
+  8. Writing files: create_text_file(filename, content, folder). folder accepts
+     Desktop/Documents/Downloads/Pictures/Videos, a relative subfolder under
+     the user profile (e.g. Desktop\\deck), or ANY absolute path (e.g.
+     D:\\projects\\deck\\index.html). Only Windows system folders (Windows,
+     Program Files, ProgramData) are refused. Never put a deliverable in the
+     WinBrow app/project folder. Use mcp_filesystem_write_file only when the
+     MCP filesystem server is enabled and the target is inside its allowed roots.
+  9. Downloads: download_file(url, filename, folder). folder accepts
+     Desktop/Documents/Downloads or any absolute folder path. Never claim a
      download without a successful step.
  10. To compile, build, test or verify existing code use run_command(command,
      cwd) — never build_tool for an existing command. Only when no listed skill
@@ -240,7 +276,8 @@ SKILL RULES:
      HISTORY; do not re-read the same file or overlapping ranges. If the result
      is truncated, continue with the returned next_offset.
  20. Expanding or rewriting a document: write the complete new text in ONE
-     create_text_file or mcp_filesystem_write_file call. Use
+     create_text_file call (folder may be an absolute path) or
+     mcp_filesystem_write_file. Use
      mcp_filesystem_edit_file only for a small exact replacement; oldText must
      match the file exactly. Never rewrite a whole file through repeated
      write_file/edit_file steps.
@@ -262,8 +299,10 @@ SKILL RULES:
      screen or type. Never screen-read or type when the activation failed; a
      tray-only app that is "running" is not open. Never screen-read a browser
      or another app when the task names the app. For search boxes and list
-     results, prefer the keyboard: focus the field, type the query, then Down
-     + Enter to open the first match. If a click reports "PyAutoGUI fail-safe"
+     results, prefer the keyboard: focus the field and type the known query.
+     Observe the results before choosing a match; Down + Enter may open a known,
+     intended result but Enter ends the batch and requires state verification.
+          If a click reports "PyAutoGUI fail-safe"
      or "Refusing click", do NOT retry it — the cursor is in a screen corner or
      the coordinates are bad. Use the keyboard path or ask the user to move the
      mouse.
@@ -274,7 +313,9 @@ SKILL RULES:
   25. ANY other image request — "download/find/save some pictures of X", "get
      an image of X", "download this image <url>", document assets — is
      download_images(query=<subject or direct image URL>, count, folder,
-     source). It searches general web photos first (DuckDuckGo/Bing), then
+     source). folder accepts an alias or any absolute folder path (Windows
+     system folders are refused). It searches general web photos first
+     (DuckDuckGo/Bing), then
      licensed Wikimedia photos; Wallhaven/NekosAPI are used only for art,
      anime, or wallpaper requests. Validates each file and saves it. Never
      open the browser or web_search for pictures, and never download an image
@@ -294,6 +335,12 @@ SKILL RULES:
      • Deck PDF page size is 16:9 (13.333 x 7.5 in, PowerPoint widescreen) by
        default. Never export a deck as A4/Letter unless the user explicitly
        asks for a paper version.
+     • NEVER export a PDF by calling run_command with a headless browser or
+       --print-to-pdf. Use run_skill_script(skill="html-ppt",
+       script="render_deck.py", spec={"input": ..., "format": "pdf"}) for
+       decks, or run_skill_script(skill="pdf", script="pdf_tool.py",
+       spec={"operation": "from_html", ...}) for HTML pages. Those helpers
+       handle Chrome/Edge flags, file URIs, timing, repair, and validation.
      • Resume / CV / cover letter / official document / report / memo: use the
        `pdf` skill's create engine with document_kind=resume|official,
        page_size=a4 or letter (A4 default; Letter only for US), portrait, and
@@ -304,6 +351,14 @@ SKILL RULES:
      • Use theme tokens (var(--text-1), var(--bg), var(--accent)); never put
        light text on an unset/white background. Dark decks must preserve their
        background in print (print-color-adjust: exact).
+  27. OUTPUT LOCATION — generated PDFs, decks, documents, spreadsheets and
+     text files are USER deliverables, never app files. Use the exact
+     USER FOLDERS paths from WINDOWS CONTEXT. When the user names no folder,
+     save to Desktop; images default to Pictures, downloads to Downloads.
+     NEVER save a deliverable inside the WinBrow app/project/source folder,
+     and never interpret a bare relative "Desktop" as the project's Desktop:
+     a real user path starts with the user profile (C:\\Users\\<name>\\...).
+     Keep deck assets and extracted images beside their document.
 
 WEB ACCESS HIERARCHY — read this before choosing any skill
 ══════════════════════════════════════════════════════════
@@ -431,14 +486,16 @@ WORKED EXAMPLES — web access decisions
 
 "Open YouTube and play lo-fi music"
   → Layer 4. browser_navigate("https://www.youtube.com/results?search_query=lofi+music")
-  → browser_interact to play. Browser required — playing media.
+  → Observe browser_read_full on the next turn; use its selector to play.
+  → Browser required — playing media.
 
 "Go to github.com/leoantony72/laya-agent"
   → Layer 4. browser_navigate(exact URL)
   → Browser required — user explicitly asked to open a site.
 
 "Fill out the contact form on example.com"
-  → Layer 4. browser_navigate → browser_interact
+  → Layer 4. browser_navigate; stop, then browser_read_full to observe fields.
+  → Batch known-selector field edits in order, then verify actual form state.
   → Browser required — form submission.
 
 "Download the WWDC 2026 keynote slides"
@@ -511,8 +568,9 @@ TOOL_FIXER_JSON_SCHEMA = {
 }
 
 
-def build_system_blocks(skills_metadata: str,
-                        system_prompt: str | None = None) -> list[dict]:
+def build_system_blocks(
+    skills_metadata: str, system_prompt: str | None = None
+) -> list[dict]:
     """Two Anthropic-style cached system blocks.
 
     The static block never changes and is cached after the first call. The
@@ -522,25 +580,37 @@ def build_system_blocks(skills_metadata: str,
     ``system_prompt`` lets a scoped subagent replace the parent planner prompt
     while keeping the same cached-block structure.
     """
-    blocks = [{
-        "type": "text",
-        "text": system_prompt or SYSTEM_PROMPT_STATIC,
-        "cache_control": {"type": "ephemeral"},
-    }]
-    if skills_metadata:
-        blocks.append({
+    blocks = [
+        {
             "type": "text",
-            "text": skills_metadata,
+            "text": system_prompt or SYSTEM_PROMPT_STATIC,
             "cache_control": {"type": "ephemeral"},
-        })
+        }
+    ]
+    if skills_metadata:
+        blocks.append(
+            {
+                "type": "text",
+                "text": skills_metadata,
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
     return blocks
 
 
 BROWSER_BREVITY = (
     "You are on a browser turn. The page state is in HISTORY. "
-    "Emit the next single action immediately. Do not evaluate "
+    "Emit the next action or bounded known-input ordered batch immediately. "
+    "Use observed selectors only; stop at navigation or uncertain state. Do not evaluate "
     "alternative approaches unless HISTORY shows a failure."
 )
+
+
+def _batch_limit_message(steps_remaining) -> str:
+    cap = max_actions_per_turn()
+    if isinstance(steps_remaining, int) and not isinstance(steps_remaining, bool):
+        cap = min(cap, max(0, steps_remaining))
+    return f"MAX ACTIONS THIS TURN: {cap}. Use step or steps[], never both."
 
 
 def _entry_skill(entry) -> str:
@@ -557,8 +627,9 @@ def is_browser_turn(history: list) -> bool:
     return bool(history) and _entry_skill(history[-1]).startswith("browser_")
 
 
-def build_planner_message(goal: str, history: list, steps_remaining=None,
-                          skill_detail: str | None = None) -> str:
+def build_planner_message(
+    goal: str, history: list, steps_remaining=None, skill_detail: str | None = None
+) -> str:
     """Compose the planner user message from raw history (compressed)."""
     from ..utils.history import extract_tried_services, format_history
 
@@ -566,29 +637,35 @@ def build_planner_message(goal: str, history: list, steps_remaining=None,
         f"GOAL: {goal}",
         f"HISTORY:\n{format_history(history)}",
         extract_tried_services(history),
-        (f"STEPS REMAINING: {steps_remaining}"
-         if steps_remaining is not None else ""),
+        (f"STEPS REMAINING: {steps_remaining}" if steps_remaining is not None else ""),
     ]
     if skill_detail:
         parts.append(
-            "SKILL DETAIL (full instructions for the skill you just chose — "
-            f"read before acting):\n{skill_detail}"
+            "SKILL DETAIL (active playbook guidance and/or the skill you just "
+            f"chose — read before acting):\n{skill_detail}"
         )
-    question = "What is the single best next action? Output ONLY the JSON object."
+    parts.append(_batch_limit_message(steps_remaining))
+    question = "What is the best next action or bounded known-input batch? Output ONLY the JSON object."
     if is_browser_turn(history):
         question = f"{BROWSER_BREVITY}\n{question}"
     parts.append(question)
     return "\n\n".join(part for part in parts if part)
 
 
-def build_loop_messages(utterance: str, history_block: str, context_block: str,
-                        memory_block: str, skills_block: str,
-                        tried_block: str = "", steps_remaining=None,
-                        skills_metadata: str = "",
-                        skill_detail: str | None = None,
-                        browser_turn: bool = False,
-                        system_prompt: str | None = None,
-                        volatile_block: str = "") -> list[dict]:
+def build_loop_messages(
+    utterance: str,
+    history_block: str,
+    context_block: str,
+    memory_block: str,
+    skills_block: str,
+    tried_block: str = "",
+    steps_remaining=None,
+    skills_metadata: str = "",
+    skill_detail: str | None = None,
+    browser_turn: bool = False,
+    system_prompt: str | None = None,
+    volatile_block: str = "",
+) -> list[dict]:
     """Planner messages with cached system blocks and optional SKILL DETAIL.
 
     Layout is chosen for prefix caching: everything before HISTORY is fixed for
@@ -619,25 +696,32 @@ def build_loop_messages(utterance: str, history_block: str, context_block: str,
     # so the planner reads the newly revealed instructions last.
     if skill_detail:
         parts.append(
-            "SKILL DETAIL (full instructions for the skill you just chose — "
-            f"read before acting):\n{skill_detail}"
+            "SKILL DETAIL (active playbook guidance and/or the skill you just "
+            f"chose — read before acting):\n{skill_detail}"
         )
     if skills_block:
         parts.append(f"OTHER TOOLS:\n{skills_block}")
-    question = "What is the single best next action? Output ONLY the JSON object."
+    parts.append(_batch_limit_message(steps_remaining))
+    question = "What is the best next action or bounded known-input batch? Output ONLY the JSON object."
     if browser_turn:
         question = f"{BROWSER_BREVITY}\n{question}"
     parts.append(question)
 
     return [
-        {"role": "system", "content": build_system_blocks(
-            skills_metadata, system_prompt=system_prompt,
-        )},
+        {
+            "role": "system",
+            "content": build_system_blocks(
+                skills_metadata,
+                system_prompt=system_prompt,
+            ),
+        },
         {"role": "user", "content": "\n\n".join(parts)},
     ]
 
 
-def build_chat_messages(utterance: str, context_block: str, memory_block: str) -> list[dict]:
+def build_chat_messages(
+    utterance: str, context_block: str, memory_block: str
+) -> list[dict]:
     user = (
         f"WINDOWS CONTEXT:\n{context_block}\n\n"
         f"CONVERSATION:\n{memory_block}\n\n"
@@ -653,12 +737,16 @@ def build_normalizer_messages(text: str, vocab_hints: list[str]) -> list[dict]:
     hints = ", ".join(vocab_hints[:40]) if vocab_hints else "(none)"
     return [
         {"role": "system", "content": NORMALIZER_SYSTEM},
-        {"role": "user", "content": f"Known vocabulary on this system: {hints}\n\nCommand: {text}"},
+        {
+            "role": "user",
+            "content": f"Known vocabulary on this system: {hints}\n\nCommand: {text}",
+        },
     ]
 
 
-def build_tool_repair_messages(tool_name: str, description: str, script: str,
-                               args_block: str, failure: str) -> list[dict]:
+def build_tool_repair_messages(
+    tool_name: str, description: str, script: str, args_block: str, failure: str
+) -> list[dict]:
     user = (
         f"TOOL NAME: {tool_name}\n"
         f"DESCRIPTION: {description}\n"

@@ -101,8 +101,13 @@ def main() -> None:
         fail("'name' contains characters that are invalid in a folder name.")
 
     template = _resolve_template(str(spec.get("template") or "deck"))
-    parent = resolve_path(spec.get("output_parent") or _default_parent())
-    out_dir = parent / name
+    parent = resolve_path(
+        spec.get("output_parent") or _default_parent(),
+        default_dir=_default_parent(),
+    )
+    # The planner sometimes passes the intended deck folder as output_parent.
+    # Do not create Desktop\deck\deck in that case.
+    out_dir = parent if parent.name.lower() == name.lower() else parent / name
     overwrite = bool(spec.get("overwrite", False))
     if out_dir.exists():
         if not overwrite:

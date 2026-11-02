@@ -1,15 +1,56 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentState } from "./lib/useAgent";
 import Server from "./Server";
+import Settings from "./Settings";
 import Trace from "./Trace";
+import CopyButton from "./components/CopyButton";
 import { SERVER_HTTP } from "./lib/agent";
 import { elapsed, relativeTime, shortTime, argHint } from "./lib/format";
+import {
+  ArrowUp,
+  ArrowUpRight,
+  AudioLines,
+  Files,
+  Globe2,
+  MessageSquare,
+  Minus,
+  Plus,
+  ScanText,
+  Settings as SettingsIcon,
+  Sparkles,
+  Square,
+  TerminalSquare,
+  X,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 
 const EXAMPLES = [
-  "open WordPad and type a short AI document",
-  "find the latest invoice on my Desktop and summarize it",
-  "download the current weather radar for Kochi",
-  "compare these two PDFs and list the differences",
+  {
+    title: "Research the web",
+    detail: "Find answers, not more tabs",
+    prompt:
+      "Research the latest developments in renewable energy and summarize with sources",
+    icon: Globe2,
+  },
+  {
+    title: "Work with files",
+    detail: "Find the details that matter",
+    prompt: "Find the latest invoice on my Desktop and summarize it",
+    icon: Files,
+  },
+  {
+    title: "Create a document",
+    detail: "Turn a thought into a first draft",
+    prompt: "Create a short document explaining practical uses of AI",
+    icon: ScanText,
+  },
+  {
+    title: "Compare & analyze",
+    detail: "Make sense of the differences",
+    prompt: "Help me find and compare two PDFs, then list the differences",
+    icon: Sparkles,
+  },
 ];
 
 function StatusText({ status }: { status: string }) {
@@ -64,11 +105,17 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
     () => localStorage.getItem("winbrow.raw") === "1",
   );
   const [sidecar, setSidecar] = useState("online");
-  const [voice, setVoice] = useState({ running: false, mode: "", muted: false });
-  const [view, setView] = useState<"tasks" | "server">(() =>
+  const [voice, setVoice] = useState({
+    running: false,
+    mode: "",
+    muted: false,
+  });
+  const [view, setView] = useState<"tasks" | "server" | "settings">(() =>
     window.location.hash === "#server" || window.location.hash === "#connection"
       ? "server"
-      : "tasks",
+      : window.location.hash === "#settings"
+        ? "settings"
+        : "tasks",
   );
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -90,7 +137,9 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
 
   useEffect(() => {
     if (!api?.onMainEvent) return;
-    return api.onMainEvent("sidecar:status", (state) => setSidecar(String(state)));
+    return api.onMainEvent("sidecar:status", (state) =>
+      setSidecar(String(state)),
+    );
   }, [api]);
 
   useEffect(() => {
@@ -99,6 +148,7 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
   }, [api]);
 
   useEffect(() => {
+    if (agent.demo) return;
     let alive = true;
     const load = () => {
       fetch(`${SERVER_HTTP}/api/voice`)
@@ -114,7 +164,7 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
       alive = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [agent.demo]);
 
   const toggleVoice = () => {
     fetch(`${SERVER_HTTP}/api/voice/toggle`, { method: "POST" })
@@ -124,10 +174,19 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
   };
 
   useEffect(() => {
+    if (view === "tasks") composerRef.current?.focus();
+  }, [view, agent.activeSessionId]);
+
+  useEffect(() => {
     const node = scrollRef.current;
     if (!node || turns.length === 0) return;
     node.scrollTop = node.scrollHeight;
-  }, [agent.activeSessionId, turns.length, latestTurn?.updatedAt, latestTurn?.answer?.length]);
+  }, [
+    agent.activeSessionId,
+    turns.length,
+    latestTurn?.updatedAt,
+    latestTurn?.answer?.length,
+  ]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -152,23 +211,25 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
   });
 
   const chatItems = useMemo(() => {
-    return agent.sessionOrder
-      .map((id) => agent.sessions[id])
-      .filter((s): s is NonNullable<typeof s> => Boolean(s))
-      // A freshly created chat is a local placeholder until its first message
-      // creates a task; keep it while active, but don't leave it in the rail
-      // after the user moves back to an existing conversation.
-      .filter(
-        (s) =>
-          s.id === agent.activeSessionId ||
-          (s.taskCount ?? 0) > 0 ||
-          s.status === "running",
-      );
+    return (
+      agent.sessionOrder
+        .map((id) => agent.sessions[id])
+        .filter((s): s is NonNullable<typeof s> => Boolean(s))
+        // A freshly created chat is a local placeholder until its first message
+        // creates a task; keep it while active, but don't leave it in the rail
+        // after the user moves back to an existing conversation.
+        .filter(
+          (s) =>
+            s.id === agent.activeSessionId ||
+            (s.taskCount ?? 0) > 0 ||
+            s.status === "running",
+        )
+    );
   }, [agent.sessionOrder, agent.sessions, agent.activeSessionId]);
 
   function submit(overrideText?: string): void {
     const text = (overrideText ?? draft).trim();
-    if (!text) return;
+    if (!text || running || agent.connection !== "online") return;
     const parent = latestTurn && !latestTurn.live ? latestTurn.id : "";
     agent.run(text, parent);
     setDraft("");
@@ -185,22 +246,25 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
     });
   }
 
-  const liveLabel = agent.connection === "online" ? "connected" : agent.connection;
+  const liveLabel =
+    agent.connection === "online" ? "connected" : agent.connection;
 
   return (
     <div className="app">
       <header className="titlebar">
         <div className="brand">
-          <span className="brand-mark">◆</span>
-          <span className="brand-name">winbrow</span>
-          <span className="brand-sub">desktop agent</span>
+          <span className="brand-mark">
+            <AudioLines size={19} aria-hidden />
+          </span>
+          <span className="brand-name">WinBrow</span>
+          <span className="brand-sub">Your desktop, in flow</span>
         </div>
         <div className="view-tabs">
           <button
             className={`view-tab ${view === "tasks" ? "active" : ""}`}
             onClick={() => setView("tasks")}
           >
-            Chats
+            <MessageSquare size={14} aria-hidden /> Chats
           </button>
           <button
             className={`view-tab ${view === "server" ? "active" : ""}`}
@@ -218,6 +282,13 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
             />
             Server
           </button>
+          <button
+            className={`view-tab ${view === "settings" ? "active" : ""}`}
+            onClick={() => setView("settings")}
+            title="Environment settings"
+          >
+            <SettingsIcon size={14} aria-hidden /> Settings
+          </button>
         </div>
         <div className="titlebar-spacer" />
         <button
@@ -228,16 +299,44 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
           raw reasoning {rawReasoning ? "on" : "off"}
         </button>
         <div className="window-buttons">
-          <button onClick={() => api?.minimize()} title="Minimize">–</button>
-          <button onClick={() => api?.maximize()} title="Maximize">□</button>
-          <button className="close" onClick={() => api?.closeDashboard()} title="Close">×</button>
+          <button
+            onClick={() => api?.minimize()}
+            title="Minimize"
+            aria-label="Minimize"
+          >
+            <Minus size={15} />
+          </button>
+          <button
+            onClick={() => api?.maximize()}
+            title="Maximize"
+            aria-label="Maximize"
+          >
+            <Square size={12} />
+          </button>
+          <button
+            className="close"
+            onClick={() => api?.closeDashboard()}
+            title="Close"
+            aria-label="Close"
+          >
+            <X size={16} />
+          </button>
         </div>
       </header>
 
       <div className="layout">
         <aside className="rail">
+          <div className="rail-intro">
+            <span className="workspace-icon">
+              <TerminalSquare size={18} aria-hidden />
+            </span>
+            <div>
+              <strong>Personal workspace</strong>
+              <span>Make room for what matters</span>
+            </div>
+          </div>
           <div className="rail-head">
-            <span>chats</span>
+            <span>Recent chats</span>
             <button
               className="rail-new"
               onClick={() => {
@@ -246,8 +345,9 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
                 composerRef.current?.focus();
               }}
               title="New chat (Ctrl+K)"
+              aria-label="New chat (Ctrl+K)"
             >
-              +
+              <Plus size={16} aria-hidden />
             </button>
           </div>
           <div className="rail-list">
@@ -258,24 +358,31 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
                 <div
                   key={item.id}
                   className={`rail-item ${item.id === agent.activeSessionId ? "active" : ""}`}
-                  onClick={() => {
-                    setView("tasks");
-                    agent.selectSession(item.id);
-                  }}
                 >
-                  <span
-                    className={`dot dot-${
-                      item.status === "running"
-                        ? "running"
-                        : item.status === "needs_input"
-                          ? "needs_input"
-                          : item.status
-                    }`}
-                  />
-                  <span className="rail-goal">{item.title}</span>
-                  <span className="rail-meta">
-                    {relativeTime(item.updatedAt || item.createdAt)}
-                  </span>
+                  <button
+                    className="rail-select"
+                    aria-current={
+                      item.id === agent.activeSessionId ? "page" : undefined
+                    }
+                    onClick={() => {
+                      setView("tasks");
+                      agent.selectSession(item.id);
+                    }}
+                  >
+                    <span
+                      className={`dot dot-${
+                        item.status === "running"
+                          ? "running"
+                          : item.status === "needs_input"
+                            ? "needs_input"
+                            : item.status
+                      }`}
+                    />
+                    <span className="rail-goal">{item.title}</span>
+                    <span className="rail-meta">
+                      {relativeTime(item.updatedAt || item.createdAt)}
+                    </span>
+                  </button>
                   <button
                     className="rail-del"
                     title="Delete chat"
@@ -284,7 +391,7 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
                       void agent.deleteChat(item.id);
                     }}
                   >
-                    ×
+                    <X size={13} aria-hidden />
                   </button>
                 </div>
               ))
@@ -305,7 +412,11 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
             </div>
             <div className="rail-stat">
               <span>voice</span>
-              <button className="rail-link" onClick={toggleVoice} title="Start/stop local voice">
+              <button
+                className="rail-link"
+                onClick={toggleVoice}
+                title="Start/stop local voice"
+              >
                 {voice.running
                   ? voice.muted
                     ? "muted"
@@ -321,7 +432,9 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
         </aside>
 
         <main className="main">
-          {view === "server" ? (
+          {view === "settings" ? (
+            <Settings />
+          ) : view === "server" ? (
             <Server agent={agent} />
           ) : currentSession && turns.length > 0 ? (
             <>
@@ -363,7 +476,14 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
                     <div className="turn-user-msg">
                       <span className="turn-user-badge">You</span>
                       <div className="turn-user-text">{turn.goal}</div>
-                      <span className="turn-user-meta">{shortTime(turn.createdAt)}</span>
+                      <CopyButton
+                        text={turn.goal}
+                        title="Copy your message"
+                        className="answer-copy turn-copy"
+                      />
+                      <span className="turn-user-meta">
+                        {shortTime(turn.createdAt)}
+                      </span>
                     </div>
                     <div className="turn-agent-msg">
                       <Trace
@@ -378,27 +498,48 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
             </>
           ) : (
             <div className="empty">
-              <pre className="empty-logo">{`  ██╗    ██╗██╗███╗   ██╗██████╗ ██████╗  ██████╗ ██╗    ██╗
-  ██║    ██║██║████╗  ██║██╔══██╗██╔══██╗██╔═══██╗██║    ██║
-  ██║ █╗ ██║██║██╔██╗ ██║██████╔╝██████╔╝██║   ██║██║ █╗ ██║
-  ██║███╗██║██║██║╚██╗██║██╔══██╗██╔══██╗██║   ██║██║███╗██║
-  ╚███╔███╔╝██║██║ ╚████║██████╔╝██║  ██║╚██████╔╝╚███╔███╔╝
-   ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚══╝╚══╝`}</pre>
+              <div className="welcome-emblem">
+                <AudioLines size={32} strokeWidth={1.5} aria-hidden />
+              </div>
+              <Badge variant="outline" className="welcome-badge">
+                <span
+                  className={`dot dot-${agent.connection === "online" ? "success" : "running"}`}
+                />{" "}
+                YOUR DESKTOP COPILOT
+              </Badge>
+              <h1>
+                Less busywork.
+                <br />
+                <span>More possibility.</span>
+              </h1>
               <div className="empty-sub">
-                Describe a task or command. The agent streams its plan, every tool call,
-                and the answer right here.
+                A little help for your everyday. Research, create, and get
+                things done
+                <br className="welcome-break" /> across your desktop—with you in
+                control.
               </div>
               <div className="empty-examples">
                 {EXAMPLES.map((example) => (
                   <button
-                    key={example}
+                    key={example.title}
                     className="example"
                     onClick={() => {
-                      setDraft(example);
+                      setDraft(example.prompt);
                       composerRef.current?.focus();
                     }}
                   >
-                    {example}
+                    <span className="example-icon">
+                      <example.icon size={19} strokeWidth={1.6} aria-hidden />
+                    </span>
+                    <span className="example-copy">
+                      <strong>{example.title}</strong>
+                      <span>{example.detail}</span>
+                    </span>
+                    <ArrowUpRight
+                      className="example-arrow"
+                      size={15}
+                      aria-hidden
+                    />
                   </button>
                 ))}
               </div>
@@ -410,9 +551,14 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
               <div className="confirm-text">
                 <strong>{agent.confirm.tier?.toUpperCase()}</strong>{" "}
                 {agent.confirm.message || `Allow “${agent.confirm.tool}”?`}
-                <span className="confirm-args">{argHint(agent.confirm.args)}</span>
+                <span className="confirm-args">
+                  {argHint(agent.confirm.args)}
+                </span>
               </div>
-              <button className="btn btn-primary" onClick={() => agent.respond(true)}>
+              <button
+                className="btn btn-primary"
+                onClick={() => agent.respond(true)}
+              >
                 Allow
               </button>
               <button className="btn" onClick={() => agent.respond(false)}>
@@ -424,7 +570,11 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
           {view === "tasks" ? (
             <div className={`composer ${running ? "composer-busy" : ""}`}>
               {/* Options & Follow-up ribbon */}
-              {latestTurn?.needsInput && latestTurn.options && latestTurn.options.length > 0 ? (
+              {latestTurn?.needsInput &&
+              latestTurn.status !== "cancelled" &&
+              latestTurn.status !== "failed" &&
+              latestTurn.options &&
+              latestTurn.options.length > 0 ? (
                 <div className="followup-options-bar">
                   <span className="followup-options-label">Choices:</span>
                   <div className="followup-options-list">
@@ -441,9 +591,14 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
                     ))}
                   </div>
                 </div>
-              ) : currentSession && turns.length > 0 && latestTurn?.status === "completed" && !running ? (
+              ) : currentSession &&
+                turns.length > 0 &&
+                latestTurn?.status === "completed" &&
+                !running ? (
                 <div className="followup-options-bar">
-                  <span className="followup-options-label">Suggested follow-ups:</span>
+                  <span className="followup-options-label">
+                    Suggested follow-ups:
+                  </span>
                   <div className="followup-options-list">
                     {getSuggestedFollowups(latestTurn).map((opt, idx) => (
                       <button
@@ -460,6 +615,7 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
               ) : null}
 
               <textarea
+                aria-label="Message WinBrow"
                 ref={composerRef}
                 value={draft}
                 rows={1}
@@ -474,7 +630,11 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
                 }
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
+                  if (
+                    event.key === "Enter" &&
+                    !event.shiftKey &&
+                    !event.nativeEvent.isComposing
+                  ) {
                     event.preventDefault();
                     submit();
                   }
@@ -486,20 +646,43 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
                 }}
               />
               <div className="composer-actions">
-                <span className="composer-hint">Enter to send · Shift+Enter for a new line</span>
+                <span className="composer-hint">
+                  <span className="composer-mode">
+                    <Sparkles size={12} aria-hidden /> Agent
+                  </span>
+                  <span>Enter to send · Shift+Enter for a new line</span>
+                </span>
                 {running ? (
-                  <button className="btn btn-stop" onClick={agent.cancel} style={{ marginRight: 8 }}>
+                  <button
+                    className="btn btn-stop"
+                    onClick={agent.cancel}
+                    style={{ marginRight: 8 }}
+                  >
                     Stop
                   </button>
                 ) : null}
-                <button
-                  className="btn btn-primary"
+                <Button
+                  className="send-button"
                   onClick={() => submit()}
-                  disabled={!draft.trim() && !running}
+                  disabled={
+                    !draft.trim() || running || agent.connection !== "online"
+                  }
                 >
-                  {currentSession && turns.length > 0 ? "Follow up" : "Run"}
-                </button>
+                  {currentSession && turns.length > 0 ? "Follow up" : "Send"}
+                  <ArrowUp size={15} aria-hidden />
+                </Button>
               </div>
+            </div>
+          ) : null}
+          {view === "tasks" ? (
+            <div className="workspace-note">
+              <span
+                className={`dot dot-${agent.connection === "online" ? "success" : "failed"}`}
+              />
+              {agent.connection === "online"
+                ? "Connected to your desktop"
+                : "Waiting for your desktop connection"}
+              <span>Risky actions always ask for permission</span>
             </div>
           ) : null}
         </main>

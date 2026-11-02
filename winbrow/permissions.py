@@ -21,15 +21,20 @@ Confirm channels:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
 import os
 import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from inspect import isawaitable
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from threading import RLock
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple
 
 log = logging.getLogger("winbrow.permissions")
 
@@ -115,16 +120,93 @@ def tool_tier(tool_name: str) -> str:
     return t
 
 
+# --------------------------------------------------------------------------- request scope
+
+
+@dataclass(frozen=True)
+class _PermissionScope:
+    utterance: str = ""
+    session_id: str = "default"
+    confirmation_id: Optional[str] = None
+
+
+_scope: ContextVar[Optional[_PermissionScope]] = ContextVar(
+    "permission_scope", default=None
+)
+
+
+@contextmanager
+def permission_scope(
+    utterance: str = "",
+    session_id: Optional[str] = None,
+    confirmation_id: Optional[str] = None,
+) -> Iterator[None]:
+    """Supply request context to executors that call gate with empty/default context.
+
+    Omitted session/confirmation and empty utterance inherit the enclosing scope.
+    The effective session outside a scope is 'default'. Explicit nondefault gate
+    context wins. Scope an exact confirmation around only its resumed tool call:
+    unrelated calls and replays of a consumed ID fail closed, even for remembered
+    T2 actions. ContextVar tokens restore the enclosing scope on exit/exception.
+    """
+    inherited = _scope.get() or _PermissionScope()
+    token = _scope.set(
+        _PermissionScope(
+            utterance=utterance or inherited.utterance,
+            session_id=inherited.session_id
+            if session_id is None
+            else (session_id or "default"),
+            confirmation_id=(
+                inherited.confirmation_id
+                if confirmation_id is None
+                else confirmation_id
+            ),
+        )
+    )
+    try:
+        yield
+    finally:
+        _scope.reset(token)
+
+
+def _effective_session(session_id: Optional[str]) -> str:
+    scope = _scope.get()
+    if scope is not None and session_id in (None, "", "default"):
+        return scope.session_id
+    return session_id or "default"
+
+
+def _session_filter(session_id: Optional[str]) -> Optional[str]:
+    # Management APIs retain their unfiltered legacy behavior outside a scope.
+    # An explicit filter (including 'default') always wins over ambient context.
+    if session_id is not None:
+        return session_id
+    scope = _scope.get()
+    return scope.session_id if scope is not None else None
+
+
 # --------------------------------------------------------------------------- action key
 
+
 def action_key(tool_name: str, args: dict) -> str:
-    """Stable fingerprint of (tool, normalized args) for allowlisting."""
-    norm = {str(k).lower(): str(v).strip().lower()[:160] for k, v in (args or {}).items()}
-    blob = f"{(tool_name or '').lower()}|{json.dumps(norm, sort_keys=True)}"
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+    """Fingerprint full, case-sensitive JSON arguments, including nested values.
+
+    v2 deliberately does not migrate old lowercased/truncated remembered grants:
+    their original arguments cannot be recovered safely. Users must approve again.
+    Nonserializable arguments are rejected rather than coerced into strings.
+    """
+    blob = json.dumps(
+        [tool_name or "", args or {}],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    return "v2:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 # --------------------------------------------------------------------------- pending store
+
 
 def _emit_confirm(pending: "PendingAction") -> None:
     """Tell the island/dashboard that a decision is waiting on the user."""
@@ -144,13 +226,17 @@ class PendingAction:
     utterance: str
     session_id: str
     created: float
-    status: str = "pending"          # pending | approved | denied
+    status: str = "pending"  # pending | approved | denied
 
     def to_dict(self) -> dict:
         return {
-            "confirmation_id": self.id, "tier": self.tier, "tool": self.tool,
-            "args": self.args, "utterance": self.utterance,
-            "session_id": self.session_id, "status": self.status,
+            "confirmation_id": self.id,
+            "tier": self.tier,
+            "tool": self.tool,
+            "args": copy.deepcopy(self.args),
+            "utterance": self.utterance,
+            "session_id": self.session_id,
+            "status": self.status,
             "message": f"Allow {self.tier.upper()} action '{self.tool}'?",
             "created": self.created,
             "expires_at": self.created + PENDING_TTL_S,
@@ -159,7 +245,7 @@ class PendingAction:
 
 # --------------------------------------------------------------------------- manager
 
-ConfirmFn = Callable[[dict], "Optional[Awaitable[bool]]"]
+ConfirmFn = Callable[[dict], bool | Awaitable[bool] | None]
 
 
 class PermissionManager:
@@ -168,17 +254,28 @@ class PermissionManager:
     def __init__(self, path: Optional[Path] = None):
         if path is None:
             env_dir = os.environ.get("WINBROW_PERMISSIONS_DIR")
-            path = (Path(env_dir) / PERMISSIONS_FILENAME) if env_dir else (DEFAULT_DIR / PERMISSIONS_FILENAME)
+            path = (
+                (Path(env_dir) / PERMISSIONS_FILENAME)
+                if env_dir
+                else (DEFAULT_DIR / PERMISSIONS_FILENAME)
+            )
         self.path = Path(path)
-        self._allowed: Dict[str, dict] = self._load()          # action_key → {tier, ts, label}
+        self._allowed: Dict[str, dict] = self._load()  # action_key → {tier, ts, label}
         self._pending: Dict[str, PendingAction] = {}
+        self._pending_lock = RLock()  # approval lookup + consumption must be atomic
         self._confirm_fn: Optional[ConfirmFn] = None
 
     # ------------------------------------------------------------------ IO
     def _load(self) -> Dict[str, dict]:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
-                return {k: v for k, v in json.load(f).items() if isinstance(v, dict)}
+                return {
+                    k: v
+                    for k, v in json.load(f).items()
+                    if k.startswith("v2:")
+                    and isinstance(v, dict)
+                    and v.get("tier") == T2
+                }
         except FileNotFoundError:
             return {}
         except Exception as e:
@@ -221,6 +318,10 @@ class PermissionManager:
             allowed=False + pending → permission_required; call /api/confirm
             allowed=False + reason  → DENIED outright (blocklist)
         """
+        scope = _scope.get()
+        utterance = utterance or (scope.utterance if scope is not None else "")
+        session_id = _effective_session(session_id)
+        confirmation_id = scope.confirmation_id if scope is not None else None
         tier = tool_tier(tool_name)
         # 'close window' is T2 per plan; other window actions stay T1
         if tool_name == "window_action" and str((args or {}).get("action", "")).lower() == "close":
@@ -254,10 +355,51 @@ class PermissionManager:
             if TIER_ORDER[s_tier] > TIER_ORDER[tier]:
                 tier = s_tier
 
-        akey = action_key(tool_name, args)
-
         if self.bypass:
             return (True, None, None)
+        try:
+            akey = action_key(tool_name, args)
+        except (TypeError, ValueError) as e:
+            return (False, f"invalid permission arguments: {e}", None)
+
+        # Exact continuation is authoritative: never fall through to a hook,
+        # remembered grant, auto-approval, or a different pending confirmation.
+        with self._pending_lock:
+            self._prune_pending()
+            if confirmation_id is not None:
+                existing = self.get_pending(confirmation_id, session_id=session_id)
+                if (
+                    existing is None
+                    or existing.tool != tool_name
+                    or action_key(existing.tool, existing.args) != akey
+                    or existing.tier != tier
+                ):
+                    return (
+                        False,
+                        "confirmation missing, expired, or does not match this action/session",
+                        None,
+                    )
+            else:
+                existing = self._find_any(tool_name, akey, session_id=session_id)
+                if existing is not None and existing.tier != tier:
+                    # A changed policy cannot reuse approval at a weaker tier.
+                    self.consume_pending(existing.id, session_id=session_id)
+                    existing = None
+            if existing is not None:
+                if existing.status == "approved":
+                    if (
+                        self.consume_pending(existing.id, session_id=session_id)
+                        is not None
+                    ):
+                        return (True, None, None)
+                    return (False, "confirmation expired before consumption", None)
+                if existing.status == "denied":
+                    return (False, "denied by user", None)
+                if existing.status == "pending":
+                    _emit_confirm(existing)
+                    return (False, None, existing.to_dict())
+                return (False, "invalid confirmation status", None)
+
         if os.environ.get("WINBROW_AUTO_APPROVE_T2", "").lower() in ("1", "true") and tier == T2:
             self.remember(akey, tier, tool_name)
             log.info(f"Auto-approved T2 action '{tool_name}' via WINBROW_AUTO_APPROVE_T2")
@@ -273,7 +415,7 @@ class PermissionManager:
         if self._confirm_fn is not None:
             try:
                 res = self._confirm_fn(self._desc(tool_name, args, tier, utterance))
-                if hasattr(res, "__await__"):
+                if isawaitable(res):
                     res = await res
                 if res:
                     if tier == T2:
@@ -284,24 +426,24 @@ class PermissionManager:
             except Exception as e:
                 log.warning(f"Confirm hook failed ({e}); falling back to pending flow")
 
-        # 2. pending-flow (server / headless): create or reuse a pending record
-        existing = self._find_any(tool_name, akey)
-        if existing is not None:
-            if existing.status == "approved":
-                return (True, None, None)       # /api/confirm approved it already
-            if existing.status == "denied":
+        # 2. pending-flow (server / headless). A hook may have awaited, so check
+        # again before creating a duplicate. A concurrent approval is not spent
+        # here; it will be consumed by the next gate invocation.
+        with self._pending_lock:
+            p = self._find_any(tool_name, akey, session_id=session_id)
+            if p is None:
+                p = PendingAction(
+                    id=uuid.uuid4().hex[:12],
+                    tier=tier,
+                    tool=tool_name,
+                    args=copy.deepcopy(args or {}),
+                    utterance=utterance or "",
+                    session_id=session_id,
+                    created=time.time(),
+                )
+                self._pending[p.id] = p
+            elif p.status == "denied":
                 return (False, "denied by user", None)
-            if existing.status == "pending":
-                _emit_confirm(existing)
-                return (False, None, existing.to_dict())
-
-        p = PendingAction(
-            id=uuid.uuid4().hex[:12], tier=tier, tool=tool_name,
-            args=dict(args or {}), utterance=utterance or "", session_id=session_id,
-            created=time.time(),
-        )
-        self._pending[p.id] = p
-        self._prune_pending()
         log.info(f"Permission {tier.upper()} needed for '{tool_name}': pending {p.id}")
         _emit_confirm(p)
         return (False, None, p.to_dict())
@@ -315,45 +457,131 @@ class PermissionManager:
 
     # ------------------------------------------------------------------ pending mgmt
     def _prune_pending(self) -> None:
-        now = time.time()
-        for pid in list(self._pending.keys()):
-            if now - self._pending[pid].created > PENDING_TTL_S:
-                del self._pending[pid]
+        with self._pending_lock:
+            now = time.time()
+            for pid, p in list(self._pending.items()):
+                if now >= p.created + PENDING_TTL_S:
+                    del self._pending[pid]
 
-    def _find_pending(self, tool_name: str, akey: str) -> Optional[PendingAction]:
-        for p in self._pending.values():
-            if action_key(p.tool, p.args) == akey and p.status == "pending":
-                return p
-        return None
+    def _find_pending(
+        self,
+        tool_name: str,
+        akey: str,
+        session_id: Optional[str] = None,
+    ) -> Optional[PendingAction]:
+        with self._pending_lock:
+            self._prune_pending()
+            session_id = _session_filter(session_id) or "default"
+            return next(
+                (
+                    p
+                    for p in self._pending.values()
+                    if p.tool == tool_name
+                    and p.session_id == session_id
+                    and p.status == "pending"
+                    and action_key(p.tool, p.args) == akey
+                ),
+                None,
+            )
 
-    def _find_any(self, tool_name: str, akey: str) -> Optional[PendingAction]:
-        for p in self._pending.values():
-            if action_key(p.tool, p.args) == akey:
-                return p
-        return None
+    def _find_any(
+        self,
+        tool_name: str,
+        akey: str,
+        session_id: Optional[str] = None,
+    ) -> Optional[PendingAction]:
+        with self._pending_lock:
+            self._prune_pending()
+            session_id = _session_filter(session_id) or "default"
+            return next(
+                (
+                    p
+                    for p in self._pending.values()
+                    if p.tool == tool_name
+                    and p.session_id == session_id
+                    and action_key(p.tool, p.args) == akey
+                ),
+                None,
+            )
 
-    def get_pending(self, confirmation_id: str) -> Optional[PendingAction]:
-        return self._pending.get(confirmation_id)
+    def get_pending(
+        self,
+        confirmation_id: str,
+        session_id: Optional[str] = None,
+    ) -> Optional[PendingAction]:
+        """Get an unexpired record; filter by explicit or ambient session if set."""
+        with self._pending_lock:
+            self._prune_pending()
+            session_id = _session_filter(session_id)
+            p = self._pending.get(confirmation_id)
+            return (
+                p
+                if p is not None and (session_id is None or p.session_id == session_id)
+                else None
+            )
 
-    def resolve_pending(self, confirmation_id: str, approve: bool, remember: bool = False) -> Optional[PendingAction]:
-        p = self._pending.get(confirmation_id)
-        if not p:
-            return None
-        p.status = "approved" if approve else "denied"
-        if approve and remember and p.tier == T2:
-            self.remember(action_key(p.tool, p.args), p.tier, p.tool)
-        return p
+    def resolve_pending(
+        self,
+        confirmation_id: str,
+        approve: bool,
+        remember: bool = False,
+        session_id: Optional[str] = None,
+    ) -> Optional[PendingAction]:
+        """Resolve once. Repeating the same decision is idempotent, not a new grant."""
+        with self._pending_lock:
+            p = self.get_pending(confirmation_id, session_id=session_id)
+            if p is None:
+                return None
+            status = "approved" if approve else "denied"
+            if p.status != "pending":
+                return p if p.status == status else None
+            p.status = status
+            if approve and remember and p.tier == T2:
+                self.remember(action_key(p.tool, p.args), p.tier, p.tool)
+            return p
 
-    def pending_list(self) -> List[dict]:
-        self._prune_pending()
-        return [p.to_dict() for p in self._pending.values() if p.status == "pending"]
+    def pending_list(self, session_id: Optional[str] = None) -> List[dict]:
+        """List waiting decisions; unscoped callers retain the global UI listing."""
+        with self._pending_lock:
+            self._prune_pending()
+            session_id = _session_filter(session_id)
+            return [
+                p.to_dict()
+                for p in self._pending.values()
+                if p.status == "pending"
+                and (session_id is None or p.session_id == session_id)
+            ]
 
-    # clean up one-shot system actions after every confirmation
-    def consume(self, tool_name: str, args: dict) -> None:
+    def consume_pending(
+        self,
+        confirmation_id: str,
+        session_id: Optional[str] = None,
+    ) -> Optional[PendingAction]:
+        """Remove exactly one unexpired record (any status), returning it if found.
+
+        This is a cleanup/cancellation API, not execution authorization. The gate
+        consumes approved records itself, before dispatch; do not pre-consume an
+        approval that will be passed to permission_scope for exact resumption.
+        """
+        with self._pending_lock:
+            p = self.get_pending(confirmation_id, session_id=session_id)
+            return self._pending.pop(p.id) if p is not None else None
+
+    def consume(
+        self, tool_name: str, args: dict, session_id: Optional[str] = None
+    ) -> None:
+        """Legacy action-wide cleanup; prefer consume_pending for exact cleanup."""
         akey = action_key(tool_name, args)
-        for pid, p in list(self._pending.items()):
-            if action_key(p.tool, p.args) == akey:
-                del self._pending[pid]
+        with self._pending_lock:
+            self._prune_pending()
+            session_id = _session_filter(session_id)
+            for pid, p in list(self._pending.items()):
+                if (
+                    p.tool == tool_name
+                    and action_key(p.tool, p.args) == akey
+                    and (session_id is None or p.session_id == session_id)
+                ):
+                    del self._pending[pid]
 
     # ------------------------------------------------------------------ allowlist
     def remember(self, akey: str, tier: str, tool_name: str) -> None:

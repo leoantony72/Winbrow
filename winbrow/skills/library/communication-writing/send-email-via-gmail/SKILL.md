@@ -1,27 +1,14 @@
 ---
-name: "send-email-via-gmail"
-skill: "send_email_via_gmail"
-args:
-  - name: "recipient_email"
-    type: "string"
-    required: true
-    default: null
-    description: "Email address of the recipient."
-  - name: "subject"
-    type: "string"
-    required: true
-    default: null
-    description: "Subject line of the email."
-  - name: "body"
-    type: "string"
-    required: true
-    default: null
-    description: "Plain-text body content of the email."
+name: send-email-via-gmail
+skill: playbook_send_email_via_gmail
+kind: playbook
+category: communication-writing
+args: []
 description: >
-  Compose and send an email through Gmail's web interface using the compose
-  URL shortcut. Use when the user asks to send an email to a recipient with a
-  given subject and body. Do not use for reading, searching, or managing
-  existing emails, or for non-Gmail providers.
+  Compose and send an email through Gmail's web interface using the
+  compose URL shortcut. Use when the user asks to send an email to a
+  recipient with a given subject and body. Do not use for reading,
+  searching, or managing existing emails, or for non-Gmail providers.
 ---
 
 ## When to Use

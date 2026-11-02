@@ -12,11 +12,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from winbrow.brain.agent_loop import AgentBrain
+from winbrow.brain.model_gateway import GatewayResponse
 from winbrow.brain.skill_registry import (
     SkillRegistryError,
     build_skills_metadata,
     load_skill_registry,
 )
+from winbrow.memory.store import MemoryStore
 from winbrow import skill_scripts
 
 
@@ -88,6 +90,79 @@ def test_playbook_step_is_acknowledgement_only(tmp_path):
     assert result.success is True
     assert "Playbook loaded" in result.output
     assert "not task completion" in result.output
+
+
+class _RecordingGateway:
+    def __init__(self, plans):
+        from types import SimpleNamespace
+
+        self.providers = [SimpleNamespace(name="fake", model="fake-1")]
+        self._plans = list(plans)
+        self.seen: list[list[dict]] = []
+
+    async def chat(self, messages, **kwargs):
+        self.seen.append(messages)
+        plan = self._plans.pop(0) if self._plans else {"kind": "done"}
+        return GatewayResponse(
+            content=json.dumps(plan), provider="fake", model="fake-1"
+        )
+
+
+class _EmptyRegistry:
+    def get(self, name):
+        # Unknown but executable singleton: validation only needs a record.
+        return object()
+
+    def available(self, ctx):
+        return []
+
+    def all_tools(self):
+        return []
+
+
+class _Ctx:
+    def to_dict(self):
+        return {"active_app": "Desktop", "running_apps": []}
+
+
+class _Session:
+    def context_block(self):
+        return "none"
+
+
+def test_playbook_detail_persists_across_later_tool_turns(tmp_path, monkeypatch):
+    _write(tmp_path / "demo" / "SKILL.md", _playbook())
+    monkeypatch.setenv("WINBROW_SKILLS_DIR", str(tmp_path))
+    gateway = _RecordingGateway([
+        {"kind": "action", "step": {"skill": "playbook_demo", "args": {}}},
+        {"kind": "action", "step": {"skill": "run_command", "args": {"command": "x"}}},
+        {"kind": "chat", "response": "ok"},
+    ])
+    store = MemoryStore(
+        db_path=tmp_path / "memory.db",
+        chroma_path=tmp_path / "chroma",
+    )
+    brain = AgentBrain(
+        gateway, _EmptyRegistry(), store, executor=None,
+        enable_skill_writer=False,
+    )
+
+    async def fake_run(skill, args, why="", ctx=None):
+        from winbrow.brain.agent_loop import BrainStepResult
+
+        return BrainStepResult(skill, args, True, "ok")
+
+    brain._run_step = fake_run
+    asyncio.run(brain.handle("do the demo", _Ctx(), _Session()))
+
+    # Turn 2 saw the playbook body. Turn 3 (after run_command) must still see
+    # it; otherwise the workflow instructions vanish mid-task.
+    assert len(gateway.seen) >= 3
+    second = gateway.seen[1][-1]["content"]
+    third = gateway.seen[2][-1]["content"]
+    assert "Do the demo action." in second
+    assert "Do the demo action." in third
+    assert "ACTIVE PLAYBOOK GUIDANCE" in third
 
 
 def test_skill_script_runs_json_spec(tmp_path, monkeypatch):

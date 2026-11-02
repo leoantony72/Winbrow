@@ -70,6 +70,7 @@ const EMPTY_VOICE: VoiceState = {
 };
 
 const PARENTS_KEY = "winbrow.parents";
+const DELETED_SESSIONS_KEY = "winbrow.deletedSessions";
 const VOICE_PHASES: VoicePhase[] = [
   "off",
   "idle",
@@ -124,6 +125,25 @@ function readParentMap(): Record<string, string> {
 
 function readParent(taskId: string): string {
   return readParentMap()[taskId] || "";
+}
+
+/** Deleted chat ids are tombstoned locally until the server confirms deletion. */
+function readDeletedSessions(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DELETED_SESSIONS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function writeDeletedSessions(ids: Set<string>): void {
+  try {
+    localStorage.setItem(DELETED_SESSIONS_KEY, JSON.stringify([...ids]));
+  } catch {
+    // localStorage can be unavailable in hardened renderers.
+  }
 }
 
 function writeParent(taskId: string, parentId: string): void {
@@ -324,10 +344,16 @@ function taskFromReplay(raw: Json): TaskView {
         task.status = "failed";
         task.live = false;
         task.error = String(payload.error || "Task failed.");
+        task.needsInput = false;
+        task.question = undefined;
+        task.options = undefined;
         break;
       case "task.cancelled":
         task.status = "cancelled";
         task.live = false;
+        task.needsInput = false;
+        task.question = undefined;
+        task.options = undefined;
         break;
       default:
         break;
@@ -655,6 +681,7 @@ export function useAgent(): AgentState {
   const wsOpenRef = useRef(false);
   const lastHealthWarnRef = useRef(0);
   const seenRef = useRef<Set<string>>(new Set());
+  const deletedSessionsRef = useRef<Set<string>>(readDeletedSessions());
   const pendingRunsRef = useRef<
     Array<{ parentId: string; goal: string; sessionId: string }>
   >([]);
@@ -961,11 +988,11 @@ export function useAgent(): AgentState {
             needsInput,
             question: needsInput
               ? String(execution.question || existing.question || "")
-              : existing.question,
+              : undefined,
             options:
               needsInput && Array.isArray(execution.options)
                 ? execution.options.map(String)
-                : existing.options,
+                : undefined,
             evidence:
               (execution.evidence as Record<string, unknown>) ||
               existing.evidence,
@@ -1372,6 +1399,9 @@ export function useAgent(): AgentState {
                 live: false,
                 updatedAt: ts,
                 error: message,
+                needsInput: false,
+                question: undefined,
+                options: undefined,
               },
             };
           });
@@ -1398,6 +1428,9 @@ export function useAgent(): AgentState {
                 status: "cancelled",
                 live: false,
                 updatedAt: ts,
+                needsInput: false,
+                question: undefined,
+                options: undefined,
               },
             };
           });
@@ -1579,6 +1612,7 @@ export function useAgent(): AgentState {
   const hydrateSession = useCallback(
     async (sessionId: string) => {
       if (!sessionId || isDemoRef.current) return;
+      if (deletedSessionsRef.current.has(sessionId)) return;
       try {
         const data = await apiGet<{ tasks: SidecarTask[] }>(
           `/api/tasks?session_id=${encodeURIComponent(sessionId)}&limit=60`,
@@ -1638,6 +1672,19 @@ export function useAgent(): AgentState {
 
   const refresh = useCallback(async () => {
     if (isDemoRef.current) return;
+
+    // Retry deletions that failed while the sidecar was offline. The tombstone
+    // keeps the chat hidden locally until the server confirms it is gone.
+    for (const id of [...deletedSessionsRef.current]) {
+      try {
+        await apiDelete<Json>(`/api/sessions/${encodeURIComponent(id)}`);
+        deletedSessionsRef.current.delete(id);
+      } catch {
+        // Keep the tombstone and retry on the next refresh.
+      }
+    }
+    writeDeletedSessions(deletedSessionsRef.current);
+
     const [sessionsResult, tasksResult, voiceResult, contextResult, permsResult] =
       await Promise.allSettled([
         apiGet<{ sessions: Json[] }>("/api/sessions?limit=50"),
@@ -1658,6 +1705,7 @@ export function useAgent(): AgentState {
       for (const row of rows) {
         const session = sessionFromApi(row);
         if (!session.id) continue;
+        if (deletedSessionsRef.current.has(session.id)) continue;
         mapped[session.id] = session;
         order.push(session.id);
       }
@@ -1665,13 +1713,16 @@ export function useAgent(): AgentState {
         const next = { ...mapped };
         // Keep optimistic chats that have not reached the database yet.
         for (const [id, session] of Object.entries(prev)) {
+          if (deletedSessionsRef.current.has(id)) continue;
           if (!next[id] && session.status === "running") next[id] = session;
         }
         return next;
       });
       commitSessionOrder((prev) => [
         ...order,
-        ...prev.filter((id) => !order.includes(id)),
+        ...prev.filter(
+          (id) => !order.includes(id) && !deletedSessionsRef.current.has(id),
+        ),
       ]);
     }
 
@@ -1849,6 +1900,9 @@ export function useAgent(): AgentState {
             status: "cancelled",
             live: false,
             updatedAt: Date.now(),
+            needsInput: false,
+            question: undefined,
+            options: undefined,
           },
         };
       });
@@ -1872,6 +1926,9 @@ export function useAgent(): AgentState {
                 status: "cancelled",
                 live: false,
                 updatedAt: Date.now(),
+                needsInput: false,
+                question: undefined,
+                options: undefined,
               },
             }
           : prev,
@@ -1902,6 +1959,8 @@ export function useAgent(): AgentState {
                     status: approve ? "completed" : "cancelled",
                     live: false,
                     needsInput: false,
+                    question: undefined,
+                    options: undefined,
                     answer: approve
                       ? "Approved. The summary was written to your Desktop."
                       : "Action denied.",
@@ -1934,6 +1993,9 @@ export function useAgent(): AgentState {
                       ...prev[current.taskId!],
                       status: "cancelled",
                       live: false,
+                      needsInput: false,
+                      question: undefined,
+                      options: undefined,
                       answer: "Action denied.",
                       updatedAt: Date.now(),
                     },
@@ -1980,6 +2042,7 @@ export function useAgent(): AgentState {
   const selectSession = useCallback(
     (id: string) => {
       if (!id) return;
+      if (deletedSessionsRef.current.has(id)) return;
       setActiveSession(id);
       void hydrateSession(id);
     },
@@ -2000,11 +2063,16 @@ export function useAgent(): AgentState {
   const deleteChat = useCallback(
     async (id: string) => {
       if (!id) return;
+      deletedSessionsRef.current.add(id);
+      writeDeletedSessions(deletedSessionsRef.current);
       if (!isDemoRef.current) {
         try {
           await apiDelete<Json>(`/api/sessions/${encodeURIComponent(id)}`);
+          deletedSessionsRef.current.delete(id);
+          writeDeletedSessions(deletedSessionsRef.current);
         } catch (error) {
-          log("warn", "Could not delete chat", String(error));
+          // The tombstone keeps it hidden and refresh() retries the delete.
+          log("warn", "Could not delete chat (will retry)", String(error));
         }
       }
       commitSessions((prev) => {
@@ -2272,7 +2340,12 @@ export function useAgent(): AgentState {
     if (running.length) {
       return running.reduce((a, b) => (a.updatedAt >= b.updatedAt ? a : b));
     }
-    const waiting = all.filter((task) => task.needsInput);
+    const waiting = all.filter(
+      (task) =>
+        task.needsInput &&
+        task.status !== "cancelled" &&
+        task.status !== "failed",
+    );
     if (waiting.length) {
       return waiting.reduce((a, b) => (a.updatedAt >= b.updatedAt ? a : b));
     }

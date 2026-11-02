@@ -41,6 +41,16 @@ from winbrow.integrations import (
     save_integration,
     test_integration,
 )
+from winbrow.browser_credentials import (
+    CredentialImportError,
+    cancel_browser_import,
+    clear_credentials,
+    commit_browser_import,
+    delete_credential,
+    list_credentials,
+    preview_browser_csv,
+)
+from winbrow.everything import ensure_everything
 from winbrow.subagents import list_profiles as list_subagent_profiles
 from winbrow import events as agent_events
 from winbrow.tasks.store import get_store
@@ -116,6 +126,7 @@ _OBSERVE_MIN_INTERVAL_PRI_SEC = 30.0
 from winbrow.mcp import get_mcp_hub, reset_mcp_hub  # noqa: E402
 _mcp_task: Optional[asyncio.Task] = None
 _mcp_conns: list = []
+_everything_task: Optional[asyncio.Task] = None
 
 
 def get_observer() -> Observer:
@@ -134,6 +145,32 @@ async def _observe_loop() -> None:
         except Exception as e:
             log.warning(f"Observe refresh failed (non-fatal): {e}")
         await asyncio.sleep(max(30.0, interval))
+
+
+async def _ensure_everything_background() -> None:
+    """Install/start optional portable Everything without blocking boot."""
+    # API tests import this module and may enter the startup event; never
+    # download binaries or spawn a background indexer from the test suite.
+    if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
+        log.debug("Everything setup skipped under pytest")
+        return
+    try:
+        result = await asyncio.to_thread(ensure_everything)
+        if result.get("status") == "ready":
+            log.info("Everything search ready")
+        elif result.get("ok"):
+            log.info(
+                "Everything is running; its first full-drive index is still "
+                "building in the background."
+            )
+        else:
+            log.info(
+                "Everything search unavailable (%s); find_files will report "
+                "that the Everything index is not ready.",
+                result.get("status"),
+            )
+    except Exception as exc:
+        log.warning("Everything setup failed (non-fatal): %s", exc)
 
 # Static Files
 static_dir = Path(__file__).parent / "static"
@@ -230,6 +267,11 @@ async def _startup() -> None:
         await run_powershell("Write-Output warm", timeout=60)
     except Exception as e:
         log.warning(f"PowerShell warm-up failed (non-fatal): {e}")
+
+    # 3b. Portable Everything/ES powers the find_files search.
+    # Download/start off the event loop so startup is not blocked.
+    global _everything_task
+    _everything_task = asyncio.create_task(_ensure_everything_background())
 
     # 4. M5: observe service — proactive suggestions on a background loop
     global _observe_task
@@ -359,8 +401,23 @@ class SettingsRequest(BaseModel):
     project_id: str = ""
 
 
+class EnvSaveRequest(BaseModel):
+    updates: dict[str, str] = {}
+    unset: list[str] = []
+
+
 class IntegrationSaveRequest(BaseModel):
     values: dict[str, str] = {}
+
+
+class BrowserCredentialPreviewRequest(BaseModel):
+    csv: str = ""
+    source: str = "browser"
+
+
+class BrowserCredentialImportRequest(BaseModel):
+    import_id: str = ""
+    ids: list[str] = []
 
 
 class BrowserRequest(BaseModel):
@@ -780,30 +837,26 @@ async def get_permissions_state():
 
 @app.post("/api/confirm")
 async def confirm_pending(req: ConfirmRequest):
-    """Approve/deny a pending T2/T3 action; approval re-runs the cached utterance."""
+    """Approve/deny a pending T2/T3 action and resume its unexecuted suffix."""
     from winbrow.permissions import get_permissions
     pm = get_permissions()
     p = pm.get_pending(req.confirmation_id)
     if not p:
         return JSONResponse({"error": "Unknown confirmation_id"}, status_code=404)
     # T2 choices are remembered by default (plan §6); T3 never.
-    remember = req.remember or (p.tier == "t2")
-    pm.resolve_pending(p.id, approve=req.approve, remember=remember)
-    if not req.approve:
-        pm.consume(p.tool, p.args)
-        return JSONResponse({
-            "status": "denied", "confirmation_id": p.id,
-            "tool": p.tool, "result": {
-                "success": False, "type": "denied",
-                "output": "Action denied by user.",
-            },
-        })
-    # Re-run the cached utterance in the same session (gate sees 'approved').
-    result = await agent.execute(p.utterance, session_id=p.session_id or "default")
-    pm.consume(p.tool, p.args)
+    result = await agent.confirm_pending(
+        req.confirmation_id,
+        req.approve,
+        remember=req.remember or (p.tier == "t2"),
+        session_id=p.session_id or None,
+    )
+    if result is None:
+        return JSONResponse({"error": "Unknown confirmation_id"}, status_code=404)
     return JSONResponse({
-        "status": "approved", "confirmation_id": p.id,
-        "tool": p.tool, "result": result,
+        "status": "approved" if req.approve else "denied",
+        "confirmation_id": p.id,
+        "tool": p.tool,
+        "result": result,
     })
 
 
@@ -932,6 +985,64 @@ async def get_settings():
 
 
 # ---------------------------------------------------------------------------
+# In-app environment settings (.env)
+# ---------------------------------------------------------------------------
+
+_BRAIN_REBUILD_KEYS = {
+    "NEBIUS_API_KEY",
+    "OPENROUTER_API_KEY",
+    "WINBROW_BRAIN_PROVIDER",
+    "WINBROW_BRAIN_MODEL",
+    "WINBROW_NEBIUS_MODEL",
+    "WINBROW_NEBIUS_BASE",
+    "WINBROW_LOCAL_LLM",
+    "WINBROW_LOCAL_LLM_ENDPOINT",
+    "WINBROW_LOCAL_LLM_MODEL",
+}
+
+
+@app.get("/api/env")
+async def api_get_env():
+    """Return grouped .env settings with secrets masked."""
+    from winbrow.env_settings import describe_env
+
+    return JSONResponse(describe_env())
+
+
+@app.post("/api/env")
+async def api_save_env(req: EnvSaveRequest):
+    """Persist selected environment variables to .env and apply them live."""
+    from winbrow.env_settings import save_env
+
+    try:
+        result = save_env(req.updates, req.unset)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    changed = set(req.updates) | set(req.unset)
+    if changed & _BRAIN_REBUILD_KEYS:
+        try:
+            from winbrow.brain import reset_gateway
+
+            reset_gateway()
+            agent.rebuild_gateway()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Could not rebuild the brain gateway: %s", exc)
+
+    if "WINBROW_BRAIN_PROVIDER" in req.updates:
+        runtime_settings["provider"] = (
+            req.updates.get("WINBROW_BRAIN_PROVIDER") or "auto"
+        )
+    if "NEBIUS_API_KEY" in req.updates:
+        runtime_settings["api_key"] = req.updates["NEBIUS_API_KEY"]
+    if "OPENROUTER_API_KEY" in req.updates:
+        runtime_settings["api_key"] = req.updates["OPENROUTER_API_KEY"]
+
+    return JSONResponse(result)
+
+
+
+# ---------------------------------------------------------------------------
 # Integrations (optional skills: Gemini, Google, Postgres, Outline, n8n, ...)
 # ---------------------------------------------------------------------------
 
@@ -976,6 +1087,57 @@ async def google_oauth_endpoint():
 
 
 # ---------------------------------------------------------------------------
+# Browser credentials (user-exported CSV -> DPAPI vault)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/browser-credentials")
+async def get_browser_credentials():
+    """List imported browser logins. Passwords are never returned."""
+    return JSONResponse(await asyncio.to_thread(list_credentials))
+
+
+@app.post("/api/browser-credentials/preview")
+async def preview_browser_credentials(req: BrowserCredentialPreviewRequest):
+    """Parse a user-exported Chromium CSV and return metadata only."""
+    try:
+        result = await asyncio.to_thread(preview_browser_csv, req.csv, req.source)
+    except CredentialImportError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(result)
+
+
+@app.post("/api/browser-credentials/import")
+async def commit_browser_credentials(req: BrowserCredentialImportRequest):
+    """Encrypt and store only the rows the user explicitly selected."""
+    try:
+        result = await asyncio.to_thread(
+            commit_browser_import, req.import_id, req.ids,
+        )
+    except CredentialImportError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(result)
+
+
+@app.post("/api/browser-credentials/import/cancel")
+async def cancel_browser_credentials(req: BrowserCredentialImportRequest):
+    """Discard a pending import without writing anything to disk."""
+    removed = await asyncio.to_thread(cancel_browser_import, req.import_id)
+    return JSONResponse({"cancelled": removed})
+
+
+@app.delete("/api/browser-credentials")
+async def delete_all_browser_credentials():
+    removed = await asyncio.to_thread(clear_credentials)
+    return JSONResponse({"deleted": removed})
+
+
+@app.delete("/api/browser-credentials/{credential_id}")
+async def delete_browser_credential(credential_id: str):
+    removed = await asyncio.to_thread(delete_credential, credential_id)
+    return JSONResponse({"deleted": removed}, status_code=200 if removed else 404)
+
+
+# ---------------------------------------------------------------------------
 # Subagents (scoped child planners + recent runs)
 # ---------------------------------------------------------------------------
 
@@ -999,63 +1161,70 @@ async def get_subagents():
 
 @app.post("/api/browser")
 async def browser_action(req: BrowserRequest):
-    """Direct browser control endpoint."""
-    b = agent.browser
-    action = req.action.lower()
+    """Direct browser control endpoint.
 
-    if action == "tabs":
-        result = await b.list_tabs()
-    elif action == "navigate":
-        result = await b.navigate_to(req.url or "", new_tab=req.new_tab)
-    elif action == "new_tab":
-        result = await b.new_tab()
-    elif action == "close_tab":
-        result = await b.close_current_tab()
-    elif action == "search":
-        result = await b.search_web(req.query or "", engine=req.engine or "google")
-    elif action == "reload":
-        result = await b.reload_page()
-    elif action == "back":
-        result = await b.go_back()
-    elif action == "forward":
-        result = await b.go_forward()
-    elif action == "screenshot":
-        result = await b.screenshot()
-    elif action == "url":
-        result = await b.get_current_url()
-    elif action == "scroll":
-        result = await b.scroll_page(req.direction or "down")
-    elif action == "execute_js":
-        result = await b.execute_js(req.text or "document.title")
-    elif action == "read_page":
-        result = await b.read_page_text()
-    elif action == "launch_cdp":
-        result = await b.launch_with_cdp(req.url or "")
-    elif action == "switch_tab":
-        result = await b.switch_tab(req.direction or "next")
-    elif action == "incognito":
-        result = await b.open_incognito(req.url or "")
-    elif action == "find":
-        result = await b.find_on_page(req.query or "")
-    elif action == "click":
-        result = await b.click_element(req.selector or "body")
-    elif action == "type":
-        result = await b.type_in_element(req.selector or "input", req.text or "")
-    elif action == "bookmark":
-        result = await b.bookmark_page()
-    elif action == "zoom_in":
-        result = await b.zoom("in")
-    elif action == "zoom_out":
-        result = await b.zoom("out")
-    elif action == "zoom_reset":
-        result = await b.zoom("reset")
-    elif action in ("ultrafast", "laya_ultrafast"):
-        goal = req.query or req.text or "search page"
-        result = await b.run_ultrafast_task(goal)
-    else:
-        return JSONResponse({"error": f"Unknown browser action: {action}"}, status_code=400)
+    Defer to a running goal instead of interleaving with its agent tab; the
+    execution lease is released while that goal waits for user approval.
+    """
+    async with agent.execution.hold():
+        b = agent.browser
+        action = req.action.lower()
 
-    return JSONResponse(result)
+        if action == "tabs":
+            result = await b.list_tabs()
+        elif action == "navigate":
+            result = await b.navigate_to(req.url or "", new_tab=req.new_tab)
+        elif action == "new_tab":
+            result = await b.new_tab()
+        elif action == "close_tab":
+            result = await b.close_current_tab()
+        elif action == "search":
+            result = await b.search_web(req.query or "", engine=req.engine or "google")
+        elif action == "reload":
+            result = await b.reload_page()
+        elif action == "back":
+            result = await b.go_back()
+        elif action == "forward":
+            result = await b.go_forward()
+        elif action == "screenshot":
+            result = await b.screenshot()
+        elif action == "url":
+            result = await b.get_current_url()
+        elif action == "scroll":
+            result = await b.scroll_page(req.direction or "down")
+        elif action == "execute_js":
+            result = await b.execute_js(req.text or "document.title")
+        elif action == "read_page":
+            result = await b.read_page_text()
+        elif action == "launch_cdp":
+            result = await b.launch_with_cdp(req.url or "")
+        elif action == "switch_tab":
+            result = await b.switch_tab(req.direction or "next")
+        elif action == "incognito":
+            result = await b.open_incognito(req.url or "")
+        elif action == "find":
+            result = await b.find_on_page(req.query or "")
+        elif action == "click":
+            result = await b.click_element(req.selector or "body")
+        elif action == "type":
+            result = await b.type_in_element(req.selector or "input", req.text or "")
+        elif action == "bookmark":
+            result = await b.bookmark_page()
+        elif action == "zoom_in":
+            result = await b.zoom("in")
+        elif action == "zoom_out":
+            result = await b.zoom("out")
+        elif action == "zoom_reset":
+            result = await b.zoom("reset")
+        elif action in ("ultrafast", "laya_ultrafast"):
+            goal = req.query or req.text or "search page"
+            result = await b.run_ultrafast_task(goal)
+        else:
+            return JSONResponse(
+                {"error": f"Unknown browser action: {action}"}, status_code=400
+            )
+
+        return JSONResponse(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1141,7 +1310,11 @@ async def websocket_endpoint(ws: WebSocket):
                     if pending:
                         last = pending[-1]
                         pm.resolve_pending(last["confirmation_id"], approve=False)
-                        pm.consume(last["tool"], last["args"])
+                        agent.brain.discard_continuation(last["confirmation_id"])
+                        pm.consume_pending(
+                            last["confirmation_id"],
+                            session_id=last.get("session_id") or None,
+                        )
                         await ws.send_json({
                             "type": "cancel.requested",
                             "task_id": task_id,
@@ -1177,15 +1350,25 @@ async def websocket_endpoint(ws: WebSocket):
                 else:
                     approve = bool(msg.get("approve"))
                     remember = bool(msg.get("remember")) or pending.tier == "t2"
-                    pm.resolve_pending(
-                        pending.id, approve=approve, remember=remember)
-                    pm.consume(pending.tool, pending.args)
-                    await ws.send_json({
-                        "type": "confirm.result",
-                        "status": "approved" if approve else "denied",
-                        "confirmation_id": pending.id,
-                        "tool": pending.tool,
-                    })
+                    result = await agent.confirm_pending(
+                        pending.id,
+                        approve,
+                        remember=remember,
+                        session_id=pending.session_id or None,
+                        emit=lambda ev: ws.send_json(ev),
+                    )
+                    if result is None:
+                        await ws.send_json({
+                            "type": "confirm.result", "status": "unknown",
+                        })
+                    else:
+                        await ws.send_json({
+                            "type": "confirm.result",
+                            "status": "approved" if approve else "denied",
+                            "confirmation_id": pending.id,
+                            "tool": pending.tool,
+                            "result": result,
+                        })
 
             elif action == "system":
                 loop = asyncio.get_event_loop()

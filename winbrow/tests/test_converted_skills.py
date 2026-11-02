@@ -1,4 +1,4 @@
-"""Conversion lint: all 46 playbooks exist, parse, and use WinBrow conventions."""
+"""Conversion lint: all 54 playbooks exist, parse, and use WinBrow conventions."""
 
 from __future__ import annotations
 
@@ -26,7 +26,10 @@ EXPECTED = {
     "solo-founder", "tailored-resume", "ship-learn-next", "tapestry",
     "git-pushing", "google-workspace", "mercury", "outline",
     "review-implementing", "test-fixing", "algorithmic-art", "skill-creator",
-    "html-ppt",
+    "html-ppt", "compare-pdf-documents", "compare-products-or-brands",
+    "open-folder-of-file", "play-youtube-video",
+    "research-and-summarize-topics", "send-email-via-gmail",
+    "set-desktop-wallpaper-from-web", "upload-file-to-google-drive",
 }
 
 BANNED = (
@@ -69,9 +72,15 @@ def _body(text: str) -> str:
 
 def test_all_expected_skills_exist_and_parse():
     registry = load_skill_registry(str(ROOT / "winbrow" / "skills"), sync_learned=False)
-    playbooks = {meta.name for meta in registry.values() if meta.kind == "playbook"}
+    # Top-level/generated skills (for example a user-created workflow) are not
+    # part of the converted library and must not make this lint fail.
+    playbooks = {
+        meta.name for meta in registry.values()
+        if meta.kind == "playbook"
+        and Path(meta.skill_md_path).is_relative_to(LIBRARY)
+    }
     assert playbooks == EXPECTED
-    assert len(playbooks) == 46
+    assert len(playbooks) == 54
 
 
 def test_each_skill_has_required_sections_and_clean_body():

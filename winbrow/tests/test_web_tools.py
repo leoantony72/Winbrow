@@ -22,8 +22,10 @@ from winbrow import web_tools
 from winbrow.web_tools import (
     _parse_ddg_html,
     _parse_ddg_lite,
+    canonical_freshness,
     execute_web_tool,
     get_web_tools,
+    normalize_freshness,
     web_fetch,
     web_search,
 )
@@ -83,6 +85,17 @@ def test_duckduckgo_parsers_skip_ads():
     <td class="result-snippet">Real snippet</td>
     """
     assert [item["url"] for item in _parse_ddg_lite(lite, 5)] == ["https://example.com/real"]
+
+
+def test_freshness_aliases_are_canonicalized_without_network():
+    assert canonical_freshness("") == ""
+    assert canonical_freshness("Day") == "day"
+    assert canonical_freshness("today") == "day"
+    assert canonical_freshness("recent") == "week"
+    assert canonical_freshness("past month") == "month"
+    assert canonical_freshness("someday") == "someday"
+    assert normalize_freshness("today") == "day"
+    assert normalize_freshness("someday") == ""
 
 
 def test_web_search_and_fetch_validation_without_network():

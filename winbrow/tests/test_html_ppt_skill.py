@@ -45,6 +45,31 @@ def test_html_ppt_is_registered():
     assert len(load_skill_body(meta)) > 2000
 
 
+def test_relative_desktop_parent_resolves_under_the_user_profile(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _run("html-ppt", "new_deck.py", {
+        "name": "profile-deck",
+        "output_parent": "Desktop",
+        "template": "deck",
+    })
+    assert (tmp_path / "Desktop" / "profile-deck" / "index.html").is_file()
+
+
+def test_project_local_desktop_parent_is_remapped(tmp_path, monkeypatch):
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _run("html-ppt", "new_deck.py", {
+        "name": "remapped-deck",
+        "output_parent": str(ROOT / "Desktop" / "remapped-deck"),
+        "template": "deck",
+    })
+    assert (tmp_path / "Desktop" / "remapped-deck" / "index.html").is_file()
+    assert not (ROOT / "Desktop" / "remapped-deck").exists()
+
+
 def test_scaffold_copies_assets_and_verifies_references(deck):
     assert deck.is_file()
     folder = deck.parent

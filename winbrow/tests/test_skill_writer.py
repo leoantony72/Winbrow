@@ -192,7 +192,9 @@ def test_extracts_file_path_as_arg(tmp_path):
     assert "upload-file-to-online-viewer" in content
 
     registry = load_skill_registry(str(tmp_path))
-    assert "upload_file_to_online_viewer" in registry
+    meta = registry["playbook_upload_file_to_online_viewer"]
+    assert meta.kind == "playbook"
+    assert "file_path" in [arg.name for arg in meta.args]
 
 
 def test_no_duplicate_skill():

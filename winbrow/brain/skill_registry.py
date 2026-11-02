@@ -629,7 +629,11 @@ def build_tool_detail(tool: Any) -> str:
             arg_name = str(getattr(arg, "name", "") or "")
             kind = str(getattr(arg, "kind", "") or "text")
             default = getattr(arg, "default", None)
-            required = default in (None, "")
+            explicit_required = getattr(arg, "required", None)
+            required = (
+                default is None if explicit_required is None
+                else bool(explicit_required)
+            )
             instr = str(getattr(arg, "instructions", "") or "").strip()
             marker = "required" if required else f"optional, default={default!r}"
             lines.append(f"- `{arg_name}` ({kind}, {marker}): {instr or 'No description.'}")

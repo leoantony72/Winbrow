@@ -52,7 +52,10 @@ def _paragraphs_to_html(content: str) -> str:
 
 
 def build(spec: dict) -> None:
-    output = resolve_path(spec.get("output_path") or spec.get("path") or "")
+    output = resolve_path(
+        spec.get("output_path") or spec.get("path") or "",
+        default_dir=Path.home() / "Desktop",
+    )
     if output.suffix.lower() != ".epub":
         output = output.with_suffix(".epub")
     ensure_parent(output)

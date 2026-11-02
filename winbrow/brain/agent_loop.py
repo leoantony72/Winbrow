@@ -8,12 +8,11 @@ Handles everything the fast-path router can't:
   • questions about past activity ("what did I open yesterday?")
   • fact capture ("remember my exports folder is D:\\Exports")
 
-Unlike a one-shot planner, the brain is called once per action: each call
-receives the original goal plus the full history of steps and their results,
-and emits EXACTLY ONE next step (or done/clarify/chat/stop). The executor runs
-that step, appends the result to history, and loops. Values discovered by one
-step (a file path, a search result) are therefore available verbatim to later
-steps instead of both steps being planned blind up front.
+The planner emits one action or a bounded group of known-input actions. The
+executor runs ordered dependencies locally, retaining per-command results and
+permissions, and returns to the planner at observation/decision boundaries.
+Independent reviewed reads can run concurrently. Unresolved future inputs are
+never guessed. Permission pauses retain an in-memory exact execution cursor.
 
 Termination: done, clarify/chat, hard permission/policy stops, a repeated
 failure that survives the bounded recovery turns, provider loss mid-task, or the
@@ -30,6 +29,7 @@ GatewayUnavailable and the orchestrator falls back to the generator tier.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import hashlib
 import json
@@ -40,9 +40,38 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
+from ..computer.tools import screen_read_text
+from ..events import (
+    bus as event_bus,
+)
+from ..events import (
+    new_step_id,
+    step_scope,
+)
+from ..permissions import get_permissions, permission_scope
+from ..policy import PolicyError, validate_script_safety
+from ..registry import ArgSpec, Tool
+from ..trace import log_event
+from ..utils.history import (
+    count_recent_stuck,
+    detect_repeated_failure,
+    detect_stuck,
+    extract_tried_services,
+    format_history,
+    history_full_enabled,
+    last_url,
+    tried_domains,
+)
+from . import prompt as prompts
+from .batching import (
+    StepArgumentError,
+    max_actions_per_turn,
+    policy_for,
+    validate_steps,
+)
 from .model_gateway import (
     GatewayError,
     GatewayResponse,
@@ -52,7 +81,6 @@ from .model_gateway import (
     get_reasoning_config,
     planner_temperature,
 )
-from . import prompt as prompts
 from .skill_registry import (
     SkillMeta,
     build_skills_metadata,
@@ -66,25 +94,6 @@ from .skill_writer import (
     analyse_task_for_skill,
     register_skill_in_registry,
     write_skill_to_disk,
-)
-from ..computer.tools import screen_read_text
-from ..events import (
-    bus as event_bus,
-    new_step_id,
-    step_scope,
-)
-from ..policy import PolicyError, validate_script_safety
-from ..registry import ArgSpec, Tool
-from ..trace import log_event
-from ..utils.history import (
-    count_recent_stuck,
-    detect_repeated_failure,
-    detect_stuck,
-    extract_tried_services,
-    format_history,
-    history_full_enabled,
-    last_url,
-    tried_domains,
 )
 
 log = logging.getLogger("winbrow.brain.loop")
@@ -114,49 +123,90 @@ MAX_STEPS_DEFAULT = int(os.environ.get("WINBROW_MAX_STEPS", "20"))
 #
 # Filesystem/MCP observations belong here too: after a save, edit, move or
 # rename the ONLY way to verify the new state is to re-read. The planner prompt
-# (SKILL RULE 17) explicitly requires reading a file back before claiming done,
-# so blocking that re-read would make a correct plan impossible to finish.
-REPEATABLE_SKILLS = frozenset({
-    "browser_read_page",
-    "browser_read_full",
-    "browser_get_accessibility_tree",
-    "browser_wait",
-    "screen_read_text",
-    "current_time",
-    "mcp_time_get_current_time",
-    "read_document",
-    "find_files",
-    "find_large_files",
-    "mcp_filesystem_read_file",
-    "mcp_filesystem_read_text_file",
-    "mcp_filesystem_read_multiple_files",
-    "mcp_filesystem_read_media_file",
-    "mcp_filesystem_list_directory",
-    "mcp_filesystem_list_directory_with_sizes",
-    "mcp_filesystem_directory_tree",
-    "mcp_filesystem_search_files",
-    "mcp_filesystem_get_file_info",
-    "mcp_filesystem_list_allowed_directories",
-    # Focusing an already-focused window is a harmless no-op. Skipping it used
-    # to derail plans that re-focus before typing.
-    "focus_window",
-})
+REPEATABLE_SKILLS = frozenset(
+    {
+        "browser_read_page",
+        "browser_read_full",
+        "browser_get_accessibility_tree",
+        "browser_wait",
+        "screen_read_text",
+        "current_time",
+        "mcp_time_get_current_time",
+        "read_document",
+        "find_files",
+        "find_large_files",
+        "mcp_filesystem_read_file",
+        "mcp_filesystem_read_text_file",
+        "mcp_filesystem_read_multiple_files",
+        "mcp_filesystem_read_media_file",
+        "mcp_filesystem_list_directory",
+        "mcp_filesystem_list_directory_with_sizes",
+        "mcp_filesystem_directory_tree",
+        "mcp_filesystem_search_files",
+        "mcp_filesystem_get_file_info",
+        "mcp_filesystem_list_allowed_directories",
+        # Focusing an already-focused window is a harmless no-op. Skipping it used
+        # to derail plans that re-focus before typing.
+        "focus_window",
+    }
+)
 
 # Skills whose name contains one of these words are read-only observations and
 # may safely run again (a newer version of the same MCP/native/learned tool is
 # still a "look again"). Mutating words win: a tool called read_and_write_file
 # is NOT repeatable.
-_READ_ONLY_SKILL_TOKENS = frozenset({
-    "read", "list", "get", "search", "find", "info", "stat", "tree",
-    "head", "tail", "wait", "observe", "inspect", "describe", "current",
-    "time", "state",
-})
-_MUTATING_SKILL_TOKENS = frozenset({
-    "write", "edit", "move", "copy", "delete", "remove", "create",
-    "rename", "type", "paste", "key", "click", "save", "upload",
-    "download", "install", "uninstall", "run", "exec", "execute",
-    "launch", "kill", "close", "set", "send", "print", "convert",
-})
+_READ_ONLY_SKILL_TOKENS = frozenset(
+    {
+        "read",
+        "list",
+        "get",
+        "search",
+        "find",
+        "info",
+        "stat",
+        "tree",
+        "head",
+        "tail",
+        "wait",
+        "observe",
+        "inspect",
+        "describe",
+        "current",
+        "time",
+        "state",
+    }
+)
+_MUTATING_SKILL_TOKENS = frozenset(
+    {
+        "write",
+        "edit",
+        "move",
+        "copy",
+        "delete",
+        "remove",
+        "create",
+        "rename",
+        "type",
+        "paste",
+        "key",
+        "click",
+        "save",
+        "upload",
+        "download",
+        "install",
+        "uninstall",
+        "run",
+        "exec",
+        "execute",
+        "launch",
+        "kill",
+        "close",
+        "set",
+        "send",
+        "print",
+        "convert",
+    }
+)
 
 # After this many consecutive re-emissions of the same completed step, stop
 # burning planner turns and finalize honestly. Read-only repeats get
@@ -198,7 +248,9 @@ META_SKILLS: dict[str, dict] = {
             "you get a follow-up planning turn to use it on the original request, so do NOT "
             "cram a whole multi-step goal into one build task."
         ),
-        "args": {"task": "Plain-language spec of the ONE tool to build: what it must do, inputs, outputs."},
+        "args": {
+            "task": "Plain-language spec of the ONE tool to build: what it must do, inputs, outputs."
+        },
     },
     "repair_tool": {
         "description": (
@@ -226,34 +278,70 @@ COMPUTER_SKILL_DISPATCH: Dict[str, Callable[[dict], Awaitable[dict]]] = {
 # Read-only skills that are safe to execute concurrently when the planner
 # emits a batch. Browser skills are excluded: the controller already batches
 # reads internally and shares one page state.
-PARALLEL_READ_SKILLS = frozenset({
-    "web_search", "web_fetch", "read_document", "find_files",
-    "recall_memory", "current_time",
-})
+PARALLEL_READ_SKILLS = frozenset(
+    {
+        "web_search",
+        "web_fetch",
+        "read_document",
+        "find_files",
+        "recall_memory",
+        "current_time",
+    }
+)
 
 
 def parallel_reads_enabled() -> bool:
     return os.environ.get("WINBROW_PARALLEL_READS", "0").strip().lower() in {
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
 _ACTION_VERBS = (
-    "open", "create", "make", "write", "save", "move", "copy", "rename",
-    "delete", "remove", "download", "upload", "launch", "start", "type",
-    "set", "close", "send", "install", "uninstall", "print", "search",
-    "find", "organize", "edit", "add", "change", "turn", "play", "pause",
-    "extract", "zip", "unzip", "convert", "run",
+    "open",
+    "create",
+    "make",
+    "write",
+    "save",
+    "move",
+    "copy",
+    "rename",
+    "delete",
+    "remove",
+    "download",
+    "upload",
+    "launch",
+    "start",
+    "type",
+    "set",
+    "close",
+    "send",
+    "install",
+    "uninstall",
+    "print",
+    "search",
+    "find",
+    "organize",
+    "edit",
+    "add",
+    "change",
+    "turn",
+    "play",
+    "pause",
+    "extract",
+    "zip",
+    "unzip",
+    "convert",
+    "run",
 )
 
 
 def _looks_multi_part(utterance: str) -> bool:
     """Cheap guard for 'open X, create Y and write Z' style requests."""
     low = (utterance or "").lower()
-    hits = {
-        v for v in _ACTION_VERBS
-        if re.search(rf"\b{v}(?:s|es|ed|ing)?\b", low)
-    }
+    hits = {v for v in _ACTION_VERBS if re.search(rf"\b{v}(?:s|es|ed|ing)?\b", low)}
     return len(hits) >= 2
 
 
@@ -264,9 +352,7 @@ _CLARIFY_ANSWER_RE = re.compile(
     re.I,
 )
 
-_OPTION_LINE_RE = re.compile(
-    r"^\s*(?:[-*•]|\(?[1-9]\d?[.)])\s+(.+?)\s*$"
-)
+_OPTION_LINE_RE = re.compile(r"^\s*(?:[-*•]|\(?[1-9]\d?[.)])\s+(.+?)\s*$")
 
 
 # Delegation is opt-in. These phrases are deliberately conservative: generic
@@ -292,13 +378,19 @@ def is_explicit_subagent_request(text: str) -> bool:
 
 def subagents_enabled() -> bool:
     return os.environ.get("WINBROW_SUBAGENTS", "1").strip().lower() not in {
-        "0", "false", "off", "no",
+        "0",
+        "false",
+        "off",
+        "no",
     }
 
 
 def subagents_explicit_only() -> bool:
     return os.environ.get("WINBROW_SUBAGENTS_EXPLICIT", "0").strip().lower() in {
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -382,7 +474,8 @@ def _merge_clarify_answer(utterance: str, session: Any) -> str:
         return utterance
     text = (utterance or "").strip()
     pending_options = [
-        str(option).strip() for option in (pending.get("options") or [])
+        str(option).strip()
+        for option in (pending.get("options") or [])
         if str(option).strip()
     ]
     clicked_option = any(
@@ -394,34 +487,44 @@ def _merge_clarify_answer(utterance: str, session: Any) -> str:
     question = str(pending.get("question") or "").strip()
     if not original:
         return utterance
-    merged = (
-        f"{original}\n"
-        f"User answered the earlier clarification with: {text}"
-        + (f"\nClarification question: {question}" if question else "")
+    merged = f"{original}\nUser answered the earlier clarification with: {text}" + (
+        f"\nClarification question: {question}" if question else ""
     )
     if pending_options and any(
-        _option_key(option) not in question.casefold()
-        for option in pending_options
+        _option_key(option) not in question.casefold() for option in pending_options
     ):
         merged += "\nOptions: " + " | ".join(
-            f"{index}) {option}"
-            for index, option in enumerate(pending_options, 1)
+            f"{index}) {option}" for index, option in enumerate(pending_options, 1)
         )
     return merged
 
 
 _CODE_ARTIFACT_RE = re.compile(
     r"\b[\w.-]+\.(?:go|py|js|ts|tsx|jsx|html|css|java|c|cpp|cs|rs|sh|ps1|rb|"
-    r"php|swift|kt|txt|md|json|csv)\b", re.I)
+    r"php|swift|kt|txt|md|json|csv)\b",
+    re.I,
+)
 _CODE_WORD_RE = re.compile(
     r"\b(?:program|code|script|source file|go file|python file|"
-    r"javascript file|html file|css file)\b", re.I)
+    r"javascript file|html file|css file)\b",
+    re.I,
+)
 _OUTPUT_WORD_RE = re.compile(
-    r"\b(?:run|execute|compile|prints?|output|test|verify)\b", re.I)
+    r"\b(?:run|execute|compile|prints?|output|test|verify)\b", re.I
+)
 _WRITE_SKILL_WORDS = {"write", "save", "type", "paste", "note"}
 _WRITE_SKILL_NAMES = {"create_text_file", "create_file", "file_dialog_save"}
-_RUN_SKILL_WORDS = {"run", "exec", "execute", "compile", "test", "verify",
-                    "terminal", "powershell", "shell"}
+_RUN_SKILL_WORDS = {
+    "run",
+    "exec",
+    "execute",
+    "compile",
+    "test",
+    "verify",
+    "terminal",
+    "powershell",
+    "shell",
+}
 
 
 def _skill_tokens(name: str) -> set[str]:
@@ -452,8 +555,10 @@ def _is_repeatable_skill(skill: str) -> bool:
 
 
 def _needs_code_work(utterance: str) -> bool:
-    return bool(_CODE_ARTIFACT_RE.search(utterance or "")
-                or _CODE_WORD_RE.search(utterance or ""))
+    return bool(
+        _CODE_ARTIFACT_RE.search(utterance or "")
+        or _CODE_WORD_RE.search(utterance or "")
+    )
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
@@ -462,7 +567,10 @@ _PATH_RE = re.compile(r"[A-Za-z]:\\[^\s\"'<>]+")
 
 def novelty_nudge_enabled() -> bool:
     return os.environ.get("WINBROW_NOVELTY_NUDGE", "1").strip().lower() not in {
-        "0", "false", "off", "no",
+        "0",
+        "false",
+        "off",
+        "no",
     }
 
 
@@ -488,7 +596,7 @@ def no_new_information(history: List[BrainStepResult], window: int = 5) -> bool:
     one page, qualify. Repeated identical outputs are already caught earlier
     by ``detect_stuck``.
     """
-    recent = list(history[-max(2, window):])
+    recent = list(history[-max(2, window) :])
     if len(recent) < max(2, window):
         return False
     if not all(getattr(step, "success", False) for step in recent):
@@ -511,8 +619,10 @@ def _did_write(history: List[BrainStepResult]) -> bool:
 
 
 def _did_run_or_verify(history: List[BrainStepResult]) -> bool:
-    return any(step.success and (_skill_tokens(step.skill) & _RUN_SKILL_WORDS)
-               for step in history)
+    return any(
+        step.success and (_skill_tokens(step.skill) & _RUN_SKILL_WORDS)
+        for step in history
+    )
 
 
 def _completion_gap(utterance: str, history: List[BrainStepResult]) -> str:
@@ -520,15 +630,22 @@ def _completion_gap(utterance: str, history: List[BrainStepResult]) -> str:
     ok_steps = [s for s in history if s.success]
     if not ok_steps:
         return ""
-    uploads = [i for i, s in enumerate(history)
-               if s.success and s.skill == "browser_upload_file"]
+    uploads = [
+        i
+        for i, s in enumerate(history)
+        if s.success and s.skill == "browser_upload_file"
+    ]
     if uploads:
         last_upload = uploads[-1]
         verified = any(
-            s.success and s.skill in (
-                "browser_wait", "browser_read_page", "browser_read_full",
+            s.success
+            and s.skill
+            in (
+                "browser_wait",
+                "browser_read_page",
+                "browser_read_full",
             )
-            for s in history[last_upload + 1:]
+            for s in history[last_upload + 1 :]
         )
         if not verified:
             return (
@@ -557,8 +674,6 @@ def _completion_gap(utterance: str, history: List[BrainStepResult]) -> str:
     return ""
 
 
-
-
 @dataclass
 class BrainStepResult:
     skill: str
@@ -578,15 +693,18 @@ class BrainStepResult:
         # artifact paths that later turns resolve follow-ups against. Keep the
         # whole result unless an operator asks for a smaller stream.
         try:
-            output_limit = max(0, int(os.environ.get(
-                "WINBROW_STEP_OUTPUT_CHARS", "4000")))
+            output_limit = max(
+                0, int(os.environ.get("WINBROW_STEP_OUTPUT_CHARS", "4000"))
+            )
         except ValueError:
             output_limit = 4000
         d = {
-            "skill": self.skill, "args": self.args, "success": self.success,
-            "output": self.output if output_limit == 0
-            else self.output[:output_limit],
-            "why": self.why, "elapsed_ms": self.elapsed_ms,
+            "skill": self.skill,
+            "args": self.args,
+            "success": self.success,
+            "output": self.output if output_limit == 0 else self.output[:output_limit],
+            "why": self.why,
+            "elapsed_ms": self.elapsed_ms,
         }
         if self.pending:
             d["pending"] = self.pending
@@ -603,7 +721,7 @@ class BrainStepResult:
 
 @dataclass
 class BrainResult:
-    kind: str                       # "action" | "chat" | "stop"
+    kind: str  # "action" | "chat" | "stop"
     success: bool = False
     response: str = ""
     steps: List[BrainStepResult] = field(default_factory=list)
@@ -611,12 +729,13 @@ class BrainResult:
     model: str = ""
     plan_elapsed_ms: float = 0.0
     pending: Optional[dict] = None
-    complete: bool = False          # explicit done/chat after all goal parts
+    complete: bool = False  # explicit done/chat after all goal parts
     evidence: dict = field(default_factory=dict)
-    needs_input: bool = False       # response is a question for the user
+    needs_input: bool = False  # response is a question for the user
     question: str = ""
     options: List[str] = field(default_factory=list)
-    run_id: str = ""                # trace correlation, not part of the UI dict
+    run_id: str = ""  # trace correlation
+    batches: List[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {
@@ -629,7 +748,10 @@ class BrainResult:
             "provider": self.provider,
             "model": self.model,
             "plan_elapsed_ms": self.plan_elapsed_ms,
+            "run_id": self.run_id,
         }
+        if self.batches:
+            d["batches"] = copy.deepcopy(self.batches)
         if self.pending:
             d["pending"] = self.pending
         if self.evidence:
@@ -649,8 +771,8 @@ class AgentBrain:
     def __init__(
         self,
         gateway: ModelGateway,
-        registry: Any,                     # ToolRegistry
-        store: Any,                        # MemoryStore
+        registry: Any,  # ToolRegistry
+        store: Any,  # MemoryStore
         executor: Callable[[str, dict], Awaitable[dict]],
         max_steps: Optional[int] = None,
         tool_builder: Optional[Callable[[str, Any], Awaitable[dict]]] = None,
@@ -658,21 +780,24 @@ class AgentBrain:
         allowed_skills: Optional[Callable[[str], bool]] = None,
         system_prompt: Optional[str] = None,
         enable_skill_writer: bool = True,
+        batch_guard: Optional[Callable[..., Awaitable[dict]]] = None,
     ):
         self.gateway = gateway
         self.registry = registry
         self.store = store
-        self.executor = executor           # async (tool_name, args) -> execution dict
+        self.executor = executor  # async (tool_name, args) -> execution dict
         # Read the env at construction time: server.py imports the agent
         # modules before it loads .env, so a module-level default would ignore
         # WINBROW_MAX_STEPS. WinBrowAgent is constructed after the .env load.
         self.max_steps = int(
-            max_steps if max_steps is not None
+            max_steps
+            if max_steps is not None
             else os.environ.get("WINBROW_MAX_STEPS", str(MAX_STEPS_DEFAULT))
         )
-        self.step_warn_remaining = max(1, int(
-            os.environ.get("WINBROW_STEP_WARN", str(STEP_WARN_REMAINING))))
-        self.tool_builder = tool_builder   # async (task, ctx) -> build result | None
+        self.step_warn_remaining = max(
+            1, int(os.environ.get("WINBROW_STEP_WARN", str(STEP_WARN_REMAINING)))
+        )
+        self.tool_builder = tool_builder  # async (task, ctx) -> build result | None
         # Optional interactive pause: receives a clarify question and returns
         # the user's answer. Without it, clarify is surfaced as needs_input.
         self.ask_user_fn = ask_user_fn
@@ -688,17 +813,20 @@ class AgentBrain:
         # Load after .env so WINBROW_SKILLS_DIR is honored even when the
         # server imports this module before loading environment variables.
         self.skills_dir = os.environ.get("WINBROW_SKILLS_DIR") or SKILLS_DIR
-        self.skill_registry: dict[str, SkillMeta] = load_skill_registry(
-            self.skills_dir
-        )
+        self.skill_registry: dict[str, SkillMeta] = load_skill_registry(self.skills_dir)
         if self.allowed_skills is not None:
             self.skill_registry = {
-                key: meta for key, meta in self.skill_registry.items()
+                key: meta
+                for key, meta in self.skill_registry.items()
                 if self.allowed_skills(key)
             }
         self.skills_metadata = build_skills_metadata(self.skill_registry)
         self._tool_index = ""
         self._tool_index_key: tuple = ()
+        self.batch_guard = batch_guard
+        self._continuations: dict[str, dict] = {}
+        self._batch_details_cache: tuple = ()
+        self._batch_details_text = ""
 
     # ------------------------------------------------------------------ tool index
     def _registry_tools(self, ctx: Any) -> list:
@@ -724,21 +852,19 @@ class AgentBrain:
         tools = self._registry_tools(ctx)
         key = tuple(sorted(str(getattr(tool, "name", "")) for tool in tools))
         if key != self._tool_index_key:
-            self._tool_index = build_tool_index(
-                tools, exclude=set(self.skill_registry)
-            )
+            self._tool_index = build_tool_index(tools, exclude=set(self.skill_registry))
             self._tool_index_key = key
         return self._tool_index
 
     def _skills_block(self, ctx: Any, utterance: str = "") -> str:
         """Legacy full name index (kept for older callers/tests)."""
-        return build_tool_index(
-            self._registry_tools(ctx), full_mcp_names=True
-        )
+        return build_tool_index(self._registry_tools(ctx), full_mcp_names=True)
 
     # ------------------------------------------------------- skill persistence
     def _fire_skill_writer(
-        self, goal: str, history: List[BrainStepResult],
+        self,
+        goal: str,
+        history: List[BrainStepResult],
     ) -> None:
         """Start background skill analysis without delaying the task result.
 
@@ -751,8 +877,7 @@ class AgentBrain:
         if not getattr(self, "enable_skill_writer", True):
             return
         successful = [
-            step for step in history
-            if step.success and not step.skill.startswith("_")
+            step for step in history if step.success and not step.skill.startswith("_")
         ]
         if len(successful) < 3:
             return
@@ -761,9 +886,7 @@ class AgentBrain:
         if any(str(step.skill).startswith("playbook_") for step in successful):
             return
         try:
-            task = asyncio.create_task(
-                self._maybe_save_skill(goal, list(history))
-            )
+            task = asyncio.create_task(self._maybe_save_skill(goal, list(history)))
         except RuntimeError:
             # No running event loop (rare direct/CLI caller): skip silently.
             return
@@ -771,7 +894,9 @@ class AgentBrain:
         task.add_done_callback(_SKILL_WRITER_TASKS.discard)
 
     async def _maybe_save_skill(
-        self, goal: str, history: List[BrainStepResult],
+        self,
+        goal: str,
+        history: List[BrainStepResult],
     ) -> None:
         """Background task: analyse a completed run and persist a skill.
 
@@ -796,34 +921,101 @@ class AgentBrain:
 
             path = await write_skill_to_disk(candidate, self.skills_dir)
             await register_skill_in_registry(
-                candidate.skill_key, self.skill_registry, self.skills_dir,
+                candidate.skill_key,
+                self.skill_registry,
+                self.skills_dir,
             )
             # Refresh the live cached block immediately so the next planner
             # turn can choose the new skill without restarting WinBrow.
             self.skills_metadata = build_skills_metadata(self.skill_registry)
             SKILLS_METADATA = self.skills_metadata
-            log.info(
-                f"skill_writer: saved '{candidate.name}' → {path}"
-            )
+            log.info(f"skill_writer: saved '{candidate.name}' → {path}")
         except Exception as exc:
             log.warning(f"skill_writer: failed silently — {exc}")
+
+    def has_continuation(self, confirmation_id: str) -> bool:
+        return confirmation_id in self._continuations
+
+    def discard_continuation(self, confirmation_id: str) -> None:
+        self._continuations.pop(confirmation_id, None)
+
+    async def resume_pending(
+        self, confirmation_id: str, session_id: str, emit=None
+    ) -> BrainResult:
+        state = self._continuations.pop(confirmation_id, None)
+        pending = get_permissions().get_pending(confirmation_id, session_id=session_id)
+        if (
+            state is None
+            or pending is None
+            or pending.status != "approved"
+            or state["session_id"] != session_id
+            or pending.tool != state["queued"][0]["skill"]
+            or pending.args != state["queued"][0]["args"]
+        ):
+            get_permissions().consume_pending(confirmation_id, session_id=session_id)
+            return BrainResult(
+                "action",
+                response="Continuation missing, expired or changed; observe and recover without replaying the goal.",
+            )
+        if emit is not None:
+            state["emit"] = emit
+        state["confirmation_id"] = confirmation_id
+        return await self.handle(
+            state["utterance"],
+            state["ctx"],
+            state["session"],
+            emit=state["emit"],
+            max_steps=state["step_budget"],
+            _resume=state,
+        )
+
+    def _batch_instructions(self, ctx: Any) -> str:
+        tools = self._registry_tools(ctx)
+        key = tuple(
+            (t.name, getattr(t, "impl", None), getattr(t, "is_learned", False))
+            for t in tools
+            if isinstance(getattr(t, "name", None), str)
+        )
+        if key != self._batch_details_cache:
+            details = []
+            for tool in tools:
+                name = getattr(tool, "name", "")
+                contract = policy_for(name, tool, {"selector": "observed"})
+                if not contract.ordered:
+                    continue
+                meta = self.skill_registry.get(name)
+                body = (
+                    load_skill_body(meta)
+                    if meta is not None
+                    else build_tool_detail(tool)
+                )
+                details.append(
+                    f"{name}: resource={contract.resource}; "
+                    f"barrier_after={contract.barrier_after}; {contract.reason}\n{body}"
+                )
+            self._batch_details_text = (
+                "BATCH TOOL CONTRACTS (trusted execution guidance):\n"
+                + "\n\n".join(details)
+            )
+            self._batch_details_cache = key
+        return self._batch_details_text
 
     # ------------------------------------------------------------------ main entry
     async def handle(
         self,
         utterance: str,
         ctx: Any,
-        session: Any,                       # SessionMemory
+        session: Any,  # SessionMemory
         emit: Optional[Callable[[dict], Awaitable[None]]] = None,
         max_steps: Optional[int] = None,
+        _resume: Optional[dict] = None,
     ) -> BrainResult:
-        """Closed-loop Plan → Act → Observe executor.
+        """Closed-loop execution of bounded known-input action groups.
 
-        Each iteration asks the planner for exactly ONE next action with the
-        full step history in context, executes it, appends the result, and
-        repeats. This lets later steps consume values discovered by earlier
-        ones (e.g. a path found by list_directory feeds move_file) instead of
-        planning everything blindly up front.
+        Sequential dependencies share a planner turn; unknown next inputs,
+        unreviewed tools and state-change barriers return to the planner.
+        Permission continuation restores history and the unexecuted suffix,
+        never the completed prefix.
 
         Terminates on done/chat/stop/clarify, permission or policy hard stop,
         a repeated failure after bounded recovery turns, provider loss
@@ -853,7 +1045,10 @@ class AgentBrain:
                     f"session reference hint attached ({len(reference_hint)} chars)."
                 )
         # enrich with episodic hits when the user asks about the past
-        if any(w in utterance.lower() for w in ("yesterday", "earlier", "last time", "before", "history", "did i")):
+        if any(
+            w in utterance.lower()
+            for w in ("yesterday", "earlier", "last time", "before", "history", "did i")
+        ):
             hits = self.store.search_episodic(utterance, limit=5)
             if hits:
                 memory_block += "\nRelevant past activity:\n" + "\n".join(
@@ -884,6 +1079,46 @@ class AgentBrain:
         failure_recoveries = 0
         step_budget = max_steps if max_steps is not None else self.max_steps
         skill_detail: str = ""
+        # Playbook bodies are workflow guidance, not a one-turn schema hint.
+        # Keep the latest one for the rest of the run so a tool call on the
+        # next turn cannot evict the instructions the planner is following.
+        playbook_detail: str = ""
+        resume_plan = None
+        resume_confirmation = ""
+        resume_guard = None
+        planning_rejections = 0
+        argument_rejections = 0
+        batch_rejections = 0
+        session_id = str(
+            getattr(session, "session_id", None)
+            or getattr(session, "id", None)
+            or "default"
+        )
+        if _resume is not None:
+            result = _resume["result"]
+            history = _resume["history"]
+            run_id = result.run_id
+            self._active_run_id = run_id
+            memory_block = _resume["memory_block"]
+            session_id = _resume["session_id"]
+            skill_detail = _resume["skill_detail"]
+            playbook_detail = _resume.get("playbook_detail", "")
+            last_plan_response = _resume["last_plan_response"]
+            resume_plan = {"kind": "action", "steps": _resume["queued"]}
+            resume_confirmation = _resume["confirmation_id"]
+            resume_guard = _resume["guard"]
+            for name, value in _resume["guards"].items():
+                if name == "repeats":
+                    repeats = value
+                elif name == "read_repeats":
+                    read_repeats = value
+                elif name == "blocked_skills":
+                    blocked_skills = value
+                elif name == "blocked_sigs":
+                    blocked_sigs = value
+                elif name == "loaded_playbooks":
+                    loaded_playbooks = value
+            done_challenged = _resume["done_challenged"]
 
         while len(result.steps) < step_budget:
             # The tool index is rebuilt only when the registry grows (e.g. a
@@ -891,8 +1126,9 @@ class AgentBrain:
             # byte-identical turn to turn.
             tool_catalog = self._tool_catalog(ctx)
             system_catalog = (
-                f"{self.skills_metadata}\n\n{tool_catalog}"
-                if tool_catalog else self.skills_metadata
+                f"{self.skills_metadata}\n\n{tool_catalog}\n\n{self._batch_instructions(ctx)}"
+                if tool_catalog
+                else self.skills_metadata
             )
             turn_memory = memory_block
             volatile_parts: List[str] = []
@@ -941,27 +1177,36 @@ class AgentBrain:
                     metrics=history_metrics,
                 ),
                 _ctx_block(ctx),
-                turn_memory, "",
+                turn_memory,
+                "",
                 tried_block=extract_tried_services(history),
                 steps_remaining=remaining,
                 skills_metadata=system_catalog,
-                skill_detail=skill_detail,
+                skill_detail=_compose_skill_detail(playbook_detail, skill_detail),
                 browser_turn=prompts.is_browser_turn(history),
                 system_prompt=getattr(self, "system_prompt", None),
                 volatile_block="\n".join(volatile_parts),
             )
             try:
-                plan = await self._ask_plan(
-                    messages, emit, history=history,
-                    step_index=len(result.steps),
-                    history_metrics=history_metrics,
-                )
+                if resume_plan is not None:
+                    plan, resume_plan = resume_plan, None
+                else:
+                    plan = await self._ask_plan(
+                        messages,
+                        emit,
+                        history=history,
+                        step_index=len(result.steps),
+                        history_metrics=history_metrics,
+                    )
             except GatewayUnavailable as e:
                 if not history:
                     raise
                 log.warning(f"Planner unavailable mid-task ({e}); finalizing.")
                 return self._partial_finalize(
-                    result, history, last_plan_response, "planner unavailable",
+                    result,
+                    history,
+                    last_plan_response,
+                    "planner unavailable",
                 )
             except GatewayError as e:
                 if not history:
@@ -972,19 +1217,30 @@ class AgentBrain:
                 await asyncio.sleep(1.5)
                 try:
                     plan = await self._ask_plan(
-                        messages, emit, history=history,
+                        messages,
+                        emit,
+                        history=history,
                         step_index=len(result.steps),
                         history_metrics=history_metrics,
                     )
                 except (GatewayUnavailable, GatewayError) as e2:
-                    log.warning(f"Planner error mid-task after retry ({e2}); finalizing.")
+                    log.warning(
+                        f"Planner error mid-task after retry ({e2}); finalizing."
+                    )
                     return self._partial_finalize(
-                        result, history, last_plan_response, "planner unavailable",
+                        result,
+                        history,
+                        last_plan_response,
+                        "planner unavailable",
                     )
 
             kind = str(plan.get("kind", "chat"))
-            text = str(plan.get("response") or plan.get("summary")
-                       or plan.get("question") or "").strip()
+            text = str(
+                plan.get("response")
+                or plan.get("summary")
+                or plan.get("question")
+                or ""
+            ).strip()
             log.info(f"brain turn {len(result.steps) + 1}: kind={kind}")
             _emit_thinking(plan, kind)
 
@@ -998,13 +1254,19 @@ class AgentBrain:
                 if plan.get("_parse_failed"):
                     # Both parse attempts failed. Do not pretend the model
                     # wrapped up successfully — surface the partial outcome.
-                    log.warning("Planner returned an unusable response mid-task; stopping honestly.")
+                    log.warning(
+                        "Planner returned an unusable response mid-task; stopping honestly."
+                    )
                     result.kind = "action"
                     result.success = False
                     result.response = (
                         "The planner returned an unusable response"
-                        + (f" after {len(result.steps)} step(s): "
-                           f"{self._history_summary(history)}" if history else "")
+                        + (
+                            f" after {len(result.steps)} step(s): "
+                            f"{self._history_summary(history)}"
+                            if history
+                            else ""
+                        )
                         + ". Try rephrasing the request."
                     )
                     return result
@@ -1028,7 +1290,8 @@ class AgentBrain:
                     result.complete = not bool(gap)
                     result.evidence = (
                         dict(plan.get("evidence"))
-                        if isinstance(plan.get("evidence"), dict) else {}
+                        if isinstance(plan.get("evidence"), dict)
+                        else {}
                     )
                     result.response = text or self._history_summary(history) or "Done."
                     if result.complete:
@@ -1051,20 +1314,30 @@ class AgentBrain:
                     try:
                         answer = await self.ask_user_fn(question)
                     except Exception as e:
-                        log.warning(f"ask_user callback failed ({e}); surfacing question.")
+                        log.warning(
+                            f"ask_user callback failed ({e}); surfacing question."
+                        )
                         answer = ""
                     answer = str(answer or "").strip()
                     if answer and clarify_rounds < 3:
                         clarify_rounds += 1
                         reply = BrainStepResult(
-                            "_user_reply", {"question": question}, True,
+                            "_user_reply",
+                            {"question": question},
+                            True,
                             f"User answered: {answer}",
                         )
                         history.append(reply)
                         if emit:
                             try:
-                                await emit({"type": "brain_step", "index": len(result.steps),
-                                            "total": len(result.steps), **reply.to_dict()})
+                                await emit(
+                                    {
+                                        "type": "brain_step",
+                                        "index": len(result.steps),
+                                        "total": len(result.steps),
+                                        **reply.to_dict(),
+                                    }
+                                )
                             except Exception:
                                 pass
                         continue
@@ -1089,7 +1362,8 @@ class AgentBrain:
                 result.complete = not bool(gap)
                 result.evidence = (
                     dict(plan.get("evidence"))
-                    if isinstance(plan.get("evidence"), dict) else {}
+                    if isinstance(plan.get("evidence"), dict)
+                    else {}
                 )
                 result.response = text or self._history_summary(history) or "Done."
                 if result.complete:
@@ -1097,25 +1371,74 @@ class AgentBrain:
                 _stream_answer(result.response)
                 return result
 
-            steps = _extract_steps(plan)
-            if not steps:
-                result.kind = "chat"
-                result.success = True
-                result.response = text or "I couldn't plan that. Try rephrasing."
-                return result
+            try:
+                normalized = copy.deepcopy(plan)
+                for item in _extract_steps(normalized):
+                    item["skill"] = resolve_skill_key(
+                        str(item.get("skill", "")), self.skill_registry
+                    )
+                steps = validate_steps(
+                    normalized,
+                    self.registry,
+                    step_budget - len(result.steps),
+                    allowed_skills=self.allowed_skills,
+                )
+            except (ValueError, TypeError) as exc:
+                planning_rejections += 1
+                argument_rejections += int(isinstance(exc, StepArgumentError))
+                coaching = f"Action proposal rejected before execution: {exc}"
+                log_event(
+                    {
+                        "type": "brain_batch_rejected",
+                        "run_id": run_id,
+                        "reason": str(exc),
+                        "steps": _rejected_steps_preview(plan),
+                    }
+                )
+                # Load the schema for the step that failed so the retry can see
+                # the exact argument names/types instead of guessing again.
+                failing_skill = str(getattr(exc, "skill", "") or "")
+                if failing_skill:
+                    try:
+                        detail = inject_skill_detail(
+                            {"step": {"skill": failing_skill}},
+                            self.skill_registry,
+                            self.registry,
+                        )
+                    except Exception:
+                        detail = None
+                    if detail:
+                        skill_detail = detail
+                fatal_rejection = (
+                    argument_rejections >= 3
+                    if isinstance(exc, StepArgumentError)
+                    else planning_rejections >= 2
+                )
+                if fatal_rejection or resume_confirmation:
+                    result.success = False
+                    result.complete = False
+                    result.response = coaching
+                    return result
+                continue
+            planning_rejections = 0
+            argument_rejections = 0
 
             log.info(f"brain step chosen: {steps[0].get('skill', '?')}")
 
             # Progressive disclosure: the turn that CHOSE the skill had only
             # metadata. Load the full body now so the NEXT planning turn sees
             # SKILL DETAIL and can execute with complete instructions.
-            detail = inject_skill_detail(
-                plan, self.skill_registry, self.registry
-            )
+            detail = inject_skill_detail(plan, self.skill_registry, self.registry)
+            chosen_skill = str(steps[0].get("skill", ""))
+            chosen_meta = self.skill_registry.get(chosen_skill)
             if detail:
                 skill_detail = detail
+                if chosen_meta is not None and getattr(
+                    chosen_meta, "kind", "tool"
+                ) == "playbook":
+                    playbook_detail = detail
                 log.info(
-                    f"skill detail loaded for '{steps[0].get('skill', '')}' "
+                    f"skill detail loaded for '{chosen_skill}' "
                     f"({len(detail)} chars)"
                 )
 
@@ -1124,7 +1447,64 @@ class AgentBrain:
 
             done_sigs = {_step_signature(s.skill, s.args) for s in history if s.success}
             remaining = step_budget - len(result.steps)
-            batch = steps[:remaining]
+            batch = steps
+            policies = [
+                policy_for(s["skill"], self.registry.get(s["skill"]), s["args"])
+                for s in batch
+            ]
+            batch_info = {
+                "batch_id": f"{run_id}_{len(result.batches) + 1}",
+                "planned": len(batch),
+                "attempted": 0,
+                "unexecuted": copy.deepcopy(batch),
+                "stop_reason": "",
+            }
+            result.batches.append(batch_info)
+            guard_state = resume_guard
+            resume_guard = None
+            if self.batch_guard is not None and (
+                len(batch) > 1 or guard_state is not None
+            ):
+                check = await self.batch_guard(batch, guard_state, "")
+                if not check.get("success"):
+                    batch_info["stop_reason"] = str(
+                        check.get("output") or "Resource state changed"
+                    )
+                    if check.get("replan"):
+                        # No member ran. A conservative contract is a planning
+                        # boundary, not a task failure: ask for singletons.
+                        batch_rejections += 1
+                        if batch_rejections >= 2:
+                            result.success = False
+                            result.complete = False
+                            result.response = batch_info["stop_reason"]
+                            return result
+                        coaching = (
+                            batch_info["stop_reason"]
+                            + " Replan as one action at a time."
+                        )
+                        continue
+                    result.success = False
+                    result.complete = False
+                    result.response = (
+                        batch_info["stop_reason"] + "; observe again before continuing."
+                    )
+                    return result
+                guard_state = check.get("state")
+            elif len(batch) > 1 and any(
+                p.resource in {"browser", "desktop"} for p in policies
+            ):
+                batch_info["stop_reason"] = (
+                    "UI batching requires a resource-state guard."
+                )
+                batch_rejections += 1
+                if batch_rejections >= 2:
+                    result.success = False
+                    result.complete = False
+                    result.response = batch_info["stop_reason"]
+                    return result
+                coaching = batch_info["stop_reason"] + " Replan as a single action."
+                continue
             precomputed: Dict[int, BrainStepResult] = {}
             if parallel_reads_enabled() and len(batch) > 1:
                 batch_sigs = [
@@ -1135,26 +1515,32 @@ class AgentBrain:
                     for step in batch
                 ]
                 if (
-                    all(str(step.get("skill", "")) in PARALLEL_READ_SKILLS
-                        for step in batch)
+                    all(
+                        str(step.get("skill", "")) in PARALLEL_READ_SKILLS
+                        and policies[index].parallel
+                        and str(step.get("skill", "")) not in blocked_skills
+                        and batch_sigs[index] not in blocked_sigs
+                        for index, step in enumerate(batch)
+                    )
                     and len(set(batch_sigs)) == len(batch_sigs)
                     and not any(sig in done_sigs for sig in batch_sigs)
                 ):
-                    results = await asyncio.gather(*(
-                        self._run_step(
-                            str(step.get("skill", "")),
-                            dict(step.get("args") or {}),
-                            str(step.get("why", "")),
-                            ctx=ctx,
+                    results = await asyncio.gather(
+                        *(
+                            self._run_step(
+                                str(step.get("skill", "")),
+                                dict(step.get("args") or {}),
+                                str(step.get("why", "")),
+                                ctx=ctx,
+                            )
+                            for step in batch
                         )
-                        for step in batch
-                    ))
-                    precomputed = dict(enumerate(results))
-                    log.info(
-                        f"Running {len(results)} read-only steps in parallel."
                     )
+                    precomputed = dict(enumerate(results))
+                    log.info(f"Running {len(results)} read-only steps in parallel.")
             batch_failure_appended = False
             for plan_index, step in enumerate(batch):
+                await asyncio.sleep(0)  # cancellation boundary before every dispatch
                 skill = str(step.get("skill", ""))
                 args = dict(step.get("args") or {})
                 why = str(step.get("why", ""))
@@ -1174,9 +1560,8 @@ class AgentBrain:
                 skip_reason = ""
                 read_count = 0
                 if (
-                    (skill in blocked_skills or sig in blocked_sigs)
-                    and not escalate_fetch
-                ):
+                    skill in blocked_skills or sig in blocked_sigs
+                ) and not escalate_fetch:
                     # The planner ignored the disable list. Enforce it instead
                     # of burning another step on the same failed/redundant call.
                     skip_reason = "blocked_skill"
@@ -1194,15 +1579,17 @@ class AgentBrain:
                                 f"({read_count}/{READ_REPEAT_LIMIT}; "
                                 "verification, not a repeat)."
                             )
-                            log_event({
-                                "type": "brain_repeat_read",
-                                "run_id": run_id,
-                                "step_index": len(result.steps),
-                                "skill": skill,
-                                "args_hash": _args_hash(skill, args),
-                                "reason": "repeatable_observation",
-                                "attempt": read_count,
-                            })
+                            log_event(
+                                {
+                                    "type": "brain_repeat_read",
+                                    "run_id": run_id,
+                                    "step_index": len(result.steps),
+                                    "skill": skill,
+                                    "args_hash": _args_hash(skill, args),
+                                    "reason": "repeatable_observation",
+                                    "attempt": read_count,
+                                }
+                            )
                         else:
                             skip_reason = "repeatable_read_loop"
                     else:
@@ -1216,7 +1603,9 @@ class AgentBrain:
                             f"{count} times; finalizing with a recovery report."
                         )
                         result = self._partial_finalize(
-                            result, history, last_plan_response,
+                            result,
+                            history,
+                            last_plan_response,
                             f"the planner kept choosing '{skill}' after it had "
                             f"already succeeded ({count} times); it was skipped "
                             "each time",
@@ -1225,14 +1614,21 @@ class AgentBrain:
                         result.complete = False
                         return result
                     prior = next(
-                        (s for s in reversed(history)
-                         if s.success and _step_signature(s.skill, s.args) == sig),
+                        (
+                            s
+                            for s in reversed(history)
+                            if s.success and _step_signature(s.skill, s.args) == sig
+                        ),
                         None,
                     )
                     prior_step = next(
-                        (i + 1 for i in range(len(history) - 1, -1, -1)
-                         if history[i].success
-                         and _step_signature(history[i].skill, history[i].args) == sig),
+                        (
+                            i + 1
+                            for i in range(len(history) - 1, -1, -1)
+                            if history[i].success
+                            and _step_signature(history[i].skill, history[i].args)
+                            == sig
+                        ),
                         0,
                     )
                     pointer = f"Step {prior_step}" if prior_step else "an earlier step"
@@ -1273,7 +1669,8 @@ class AgentBrain:
                             "of GOAL is complete."
                         )
                     if (
-                        prior and prior.output
+                        prior
+                        and prior.output
                         and skill != "web_fetch"
                         and not skill.startswith("playbook_")
                         and skip_reason != "repeatable_read_loop"
@@ -1298,41 +1695,63 @@ class AgentBrain:
                             f"STOP repeating '{skill}'. It was rejected {count} "
                             "times because repeating it cannot advance GOAL. It "
                             "is disabled for this turn. "
-                            + (f"Its last result was: {prior.output[:300]}. "
-                               if prior and prior.output else "")
+                            + (
+                                f"Its last result was: {prior.output[:300]}. "
+                                if prior and prior.output
+                                else ""
+                            )
                             + "Choose a DIFFERENT action that advances the "
                             "remaining GOAL, or emit done if every part is verified."
                         )
-                    log_event({
-                        "type": "brain_skip",
-                        "run_id": run_id,
-                        "step_index": len(result.steps),
-                        "skill": skill,
-                        "args_hash": _args_hash(skill, args),
-                        "reason": skip_reason,
-                    })
-                    log.info(f"Planner repeated completed step '{skill}'; re-planning with feedback.")
+                    batch_info["stop_reason"] = skip_reason
+                    log_event(
+                        {
+                            "type": "brain_skip",
+                            "run_id": run_id,
+                            "step_index": len(result.steps),
+                            "skill": skill,
+                            "args_hash": _args_hash(skill, args),
+                            "reason": skip_reason,
+                        }
+                    )
+                    log.info(
+                        f"Planner repeated completed step '{skill}'; re-planning with feedback."
+                    )
                     break
                 if escalate_fetch:
-                    log.info(f"Allowing one larger re-fetch of {_fetch_url_of(args)} (truncated).")
+                    log.info(
+                        f"Allowing one larger re-fetch of {_fetch_url_of(args)} (truncated)."
+                    )
 
                 step_res = precomputed.get(plan_index)
                 if step_res is None:
-                    step_res = await self._run_step(skill, args, why, ctx=ctx)
+                    cid, resume_confirmation = resume_confirmation, ""
+                    with permission_scope(
+                        utterance, session_id, confirmation_id=cid or None
+                    ):
+                        step_res = await self._run_step(skill, args, why, ctx=ctx)
+                batch_info["attempted"] += 1
+                batch_info["unexecuted"] = copy.deepcopy(batch[plan_index + 1 :])
                 result.steps.append(step_res)
                 history.append(step_res)
-                log_event({
-                    "type": "brain_step",
-                    "run_id": run_id,
-                    "step_index": len(result.steps),
-                    "skill": skill,
-                    "args_hash": _args_hash(skill, args),
-                    "output_chars": len(step_res.output or ""),
-                    "success": bool(step_res.success),
-                    "elapsed_ms": step_res.elapsed_ms,
-                    "timed_out": "timed out after" in (step_res.output or "").lower(),
-                    "has_warning": bool(step_res.warning),
-                })
+                log_event(
+                    {
+                        "type": "brain_step",
+                        "run_id": run_id,
+                        "batch_id": batch_info["batch_id"],
+                        "batch_index": plan_index + 1,
+                        "batch_size": len(batch),
+                        "step_index": len(result.steps),
+                        "skill": skill,
+                        "args_hash": _args_hash(skill, args),
+                        "output_chars": len(step_res.output or ""),
+                        "success": bool(step_res.success),
+                        "elapsed_ms": step_res.elapsed_ms,
+                        "timed_out": "timed out after"
+                        in (step_res.output or "").lower(),
+                        "has_warning": bool(step_res.warning),
+                    }
+                )
                 # A precomputed read-only batch has already executed every
                 # call. Record the remaining results even when an earlier one
                 # failed, then apply the single-step failure guard once.
@@ -1349,19 +1768,29 @@ class AgentBrain:
                         history.append(rest)
                         if rest.success:
                             done_sigs.add(_step_signature(rest_skill, rest_args))
-                        log_event({
-                            "type": "brain_step",
-                            "run_id": run_id,
-                            "step_index": len(result.steps),
-                            "skill": rest_skill,
-                            "args_hash": _args_hash(rest_skill, rest_args),
-                            "output_chars": len(rest.output or ""),
-                            "success": bool(rest.success),
-                            "elapsed_ms": rest.elapsed_ms,
-                            "timed_out": "timed out after" in (rest.output or "").lower(),
-                            "has_warning": bool(rest.warning),
-                            "batch_after_failure": True,
-                        })
+                        log_event(
+                            {
+                                "type": "brain_step",
+                                "run_id": run_id,
+                                "batch_id": batch_info["batch_id"],
+                                "batch_index": rest_index + 1,
+                                "batch_size": len(batch),
+                                "step_index": len(result.steps),
+                                "skill": rest_skill,
+                                "args_hash": _args_hash(rest_skill, rest_args),
+                                "output_chars": len(rest.output or ""),
+                                "success": bool(rest.success),
+                                "elapsed_ms": rest.elapsed_ms,
+                                "timed_out": "timed out after"
+                                in (rest.output or "").lower(),
+                                "has_warning": bool(rest.warning),
+                                "batch_after_failure": True,
+                            }
+                        )
+                    # Every precomputed read already ran concurrently, even
+                    # though their results are recorded after the failure.
+                    batch_info["attempted"] = len(batch)
+                    batch_info["unexecuted"] = []
                     precomputed = {}
                 if detect_stuck(history) and not batch_failure_appended:
                     if _is_repeatable_skill(skill):
@@ -1377,7 +1806,8 @@ class AgentBrain:
                         )
                         step_res.warning = (
                             f"{step_res.warning} {note}".strip()
-                            if step_res.warning else note
+                            if step_res.warning
+                            else note
                         )
                         log.info(
                             f"Repeat observation of '{skill}' confirmed an "
@@ -1391,7 +1821,8 @@ class AgentBrain:
                         )
                         step_res.warning = (
                             f"{step_res.warning} {stuck}".strip()
-                            if step_res.warning else stuck
+                            if step_res.warning
+                            else stuck
                         )
                         log.warning(
                             f"Brain is stuck: '{skill}' returned identical output "
@@ -1404,22 +1835,77 @@ class AgentBrain:
 
                 if emit:
                     try:
-                        await emit({
-                            "type": "brain_step",
-                            "index": len(result.steps),
-                            "total": len(result.steps),
-                            **step_res.to_dict(),
-                        })
+                        await emit(
+                            {
+                                "type": "brain_step",
+                                "batch_id": batch_info["batch_id"],
+                                "batch_index": plan_index + 1,
+                                "batch_size": len(batch),
+                                "index": len(result.steps),
+                                "total": len(result.steps),
+                                **step_res.to_dict(),
+                            }
+                        )
                     except Exception:
                         pass
 
                 # Hard stops: approval gates / policy denials — re-planning
                 # cannot change the outcome, so surface them immediately.
-                if step_res.output.startswith("[permission-required]") or step_res.output.startswith("[denied]"):
+                if step_res.output.startswith(
+                    "[permission-required]"
+                ) or step_res.output.startswith("[denied]"):
                     result.success = False
                     result.response = step_res.output
+                    batch_info["stop_reason"] = (
+                        "permission_required" if step_res.pending else "denied"
+                    )
+                    batch_info["unexecuted"] = copy.deepcopy(batch[plan_index:])
                     if step_res.pending:
                         result.pending = step_res.pending
+                        cid = str(step_res.pending.get("confirmation_id") or "")
+                        # A pending attempt did not execute and must not consume
+                        # the action budget or enter the completed-prefix cursor.
+                        saved = dataclasses.replace(
+                            result,
+                            steps=list(result.steps[:-1]),
+                            pending=None,
+                            response="",
+                            batches=copy.deepcopy(result.batches),
+                        )
+                        pm = get_permissions()
+                        self._continuations = {
+                            key: value
+                            for key, value in self._continuations.items()
+                            if pm.get_pending(key) is not None
+                        }
+                        if len(self._continuations) >= 32:
+                            oldest = next(iter(self._continuations))
+                            self._continuations.pop(oldest, None)
+                            pm.consume_pending(oldest)
+                        self._continuations[cid] = {
+                            "utterance": utterance,
+                            "ctx": ctx,
+                            "session": session,
+                            "session_id": session_id,
+                            "emit": emit,
+                            "step_budget": step_budget,
+                            "result": saved,
+                            "history": list(history[:-1]),
+                            "queued": copy.deepcopy(batch[plan_index:]),
+                            "guard": guard_state,
+                            "memory_block": memory_block,
+                            "skill_detail": skill_detail,
+                            "playbook_detail": playbook_detail,
+                            "last_plan_response": last_plan_response,
+                            "done_challenged": done_challenged,
+                            "guards": {
+                                "repeats": dict(repeats),
+                                "read_repeats": dict(read_repeats),
+                                "blocked_skills": set(blocked_skills),
+                                "blocked_sigs": set(blocked_sigs),
+                                "loaded_playbooks": set(loaded_playbooks),
+                            },
+                        }
                     return result
 
                 # A successful pip install between two failed script calls
@@ -1443,15 +1929,17 @@ class AgentBrain:
                             f"Brain repeated failure for '{skill}'; attempting "
                             f"recovery {failure_recoveries}/{FAILURE_RECOVERIES}."
                         )
-                        log_event({
-                            "type": "brain_recover",
-                            "run_id": run_id,
-                            "step_index": len(result.steps),
-                            "skill": skill,
-                            "args_hash": _args_hash(skill, args),
-                            "reason": "repeated_failure",
-                            "attempt": failure_recoveries,
-                        })
+                        log_event(
+                            {
+                                "type": "brain_recover",
+                                "run_id": run_id,
+                                "step_index": len(result.steps),
+                                "skill": skill,
+                                "args_hash": _args_hash(skill, args),
+                                "reason": "repeated_failure",
+                                "attempt": failure_recoveries,
+                            }
+                        )
                         break
                     log.warning(
                         f"Brain repeated failure for '{skill}'; stopping instead "
@@ -1478,9 +1966,7 @@ class AgentBrain:
                         f"How would you like me to proceed? Or can you do this "
                         f"step manually and let me know when to continue?"
                     )
-                    log.warning(
-                        f"Brain stuck {recent_stuck} times; forcing clarify."
-                    )
+                    log.warning(f"Brain stuck {recent_stuck} times; forcing clarify.")
                     result.kind = "chat"
                     result.success = True
                     result.needs_input = True
@@ -1489,11 +1975,35 @@ class AgentBrain:
                     return result
 
                 if step_res.success:
+                    batch_rejections = 0
                     if skill.startswith("playbook_"):
                         loaded_playbooks.add(skill)
                     done_sigs.add(sig)
                     consecutive_failures = 0
                     last_failed_skill = ""
+                    if plan_index + 1 < len(batch) and not precomputed:
+                        reason = ""
+                        if policies[plan_index].barrier_after:
+                            reason = policies[plan_index].reason
+                        elif step_res.warning:
+                            reason = "The previous action returned a warning requiring observation."
+                        elif self.batch_guard is not None:
+                            check = await self.batch_guard(
+                                batch[plan_index + 1 :], guard_state, skill
+                            )
+                            if not check.get("success"):
+                                reason = str(
+                                    check.get("output") or "Resource state changed"
+                                )
+                            else:
+                                guard_state = check.get("state")
+                        if reason:
+                            batch_info["stop_reason"] = reason
+                            coaching = f"Batch stopped; queued commands were NOT executed: {reason}. Observe actual state and replan."
+                            step_res.warning = (
+                                step_res.warning + " " + coaching
+                            ).strip()
+                            break
                     # A success is progress: give later failures a fresh
                     # recovery budget instead of exhausting it for the run.
                     failure_recoveries = 0
@@ -1542,15 +2052,17 @@ class AgentBrain:
                             f"attempting recovery {failure_recoveries}/"
                             f"{FAILURE_RECOVERIES}."
                         )
-                        log_event({
-                            "type": "brain_recover",
-                            "run_id": run_id,
-                            "step_index": len(result.steps),
-                            "skill": skill,
-                            "args_hash": _args_hash(skill, args),
-                            "reason": "consecutive_failure",
-                            "attempt": failure_recoveries,
-                        })
+                        log_event(
+                            {
+                                "type": "brain_recover",
+                                "run_id": run_id,
+                                "step_index": len(result.steps),
+                                "skill": skill,
+                                "args_hash": _args_hash(skill, args),
+                                "reason": "consecutive_failure",
+                                "attempt": failure_recoveries,
+                            }
+                        )
                         break
                     result.success = False
                     result.response = (
@@ -1559,6 +2071,7 @@ class AgentBrain:
                     )
                     return result
                 # Failure is in HISTORY now — the next turn re-plans with it.
+                batch_info["stop_reason"] = "failure_or_uncertain_outcome"
                 break
 
         # Budget exhausted without a terminal decision: say so instead of
@@ -1571,8 +2084,12 @@ class AgentBrain:
             ).strip()
         return result
 
-    def _finalize(self, result: BrainResult, history: List[BrainStepResult],
-                  plan_response: str = "") -> BrainResult:
+    def _finalize(
+        self,
+        result: BrainResult,
+        history: List[BrainStepResult],
+        plan_response: str = "",
+    ) -> BrainResult:
         """Stop the loop and report honestly from what actually ran."""
         if not history:
             result.success = False
@@ -1589,8 +2106,13 @@ class AgentBrain:
         result.response = plan_response or self._history_summary(history) or "Done."
         return result
 
-    def _partial_finalize(self, result: BrainResult, history: List[BrainStepResult],
-                          plan_response: str, reason: str) -> BrainResult:
+    def _partial_finalize(
+        self,
+        result: BrainResult,
+        history: List[BrainStepResult],
+        plan_response: str,
+        reason: str,
+    ) -> BrainResult:
         """End mid-task but say why, instead of silently reporting success."""
         res = self._finalize(result, history, plan_response)
         note = f"Stopped early: {reason}."
@@ -1600,16 +2122,22 @@ class AgentBrain:
     @staticmethod
     def _history_summary(history: List[BrainStepResult]) -> str:
         done = [s for s in history if s.success]
-        return "; ".join(
-            re.sub(r"\s+", " ", s.output or "").strip()[:100]
-            for s in done[-2:]
-        ) or ""
+        return (
+            "; ".join(
+                re.sub(r"\s+", " ", s.output or "").strip()[:100] for s in done[-2:]
+            )
+            or ""
+        )
 
     # ------------------------------------------------------------------ planning
-    async def _ask_plan(self, messages: list, emit: Optional[Callable],
-                        history: Optional[List[BrainStepResult]] = None,
-                        step_index: int = 0,
-                        history_metrics: Optional[dict] = None) -> dict:
+    async def _ask_plan(
+        self,
+        messages: list,
+        emit: Optional[Callable],
+        history: Optional[List[BrainStepResult]] = None,
+        step_index: int = 0,
+        history_metrics: Optional[dict] = None,
+    ) -> dict:
         """One planner call → parsed JSON plan. Retries once on parse failure."""
         t0 = time.perf_counter()
         reasoning_config = get_reasoning_config(history or [])
@@ -1670,8 +2198,7 @@ class AgentBrain:
                             plan["kind"] = "action"
                             plan.setdefault(
                                 "step",
-                                {"skill": plan["action"],
-                                 "args": plan.get("args", {})},
+                                {"skill": plan["action"], "args": plan.get("args", {})},
                             )
 
             parse_ok = bool(plan and "kind" in plan)
@@ -1681,49 +2208,57 @@ class AgentBrain:
             if estimated:
                 input_tokens = prompt_chars // 4
             hm = history_metrics or {}
-            log_event({
-                "type": "brain_plan",
-                "run_id": getattr(self, "_active_run_id", ""),
-                "step_index": step_index,
-                "attempt": attempt + 1,
-                "provider": getattr(resp, "provider", ""),
-                "model": getattr(resp, "model", ""),
-                "input_tokens": input_tokens,
-                "output_tokens": int(getattr(resp, "output_tokens", 0) or 0),
-                "cache_read": int(
-                    getattr(resp, "cache_read_input_tokens", 0) or 0),
-                "estimated": estimated,
-                "finish_reason": getattr(resp, "finish_reason", ""),
-                "reasoning_len": getattr(resp, "reasoning_length", 0),
-                "prompt_chars": prompt_chars,
-                "history_chars": int(hm.get("chars") or 0),
-                "history_budget": int(hm.get("budget") or 0),
-                "history_stubbed": int(hm.get("stubbed") or 0),
-                "history_recent_clipped": int(
-                    hm.get("recent_clipped") or 0),
-                "history_overflow": bool(hm.get("overflow")),
-                "plan_chars": len(getattr(resp, "content", "") or ""),
-                "parse_ok": parse_ok,
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
-            })
+            log_event(
+                {
+                    "type": "brain_plan",
+                    "run_id": getattr(self, "_active_run_id", ""),
+                    "step_index": step_index,
+                    "attempt": attempt + 1,
+                    "provider": getattr(resp, "provider", ""),
+                    "model": getattr(resp, "model", ""),
+                    "input_tokens": input_tokens,
+                    "output_tokens": int(getattr(resp, "output_tokens", 0) or 0),
+                    "cache_read": int(getattr(resp, "cache_read_input_tokens", 0) or 0),
+                    "estimated": estimated,
+                    "finish_reason": getattr(resp, "finish_reason", ""),
+                    "reasoning_len": getattr(resp, "reasoning_length", 0),
+                    "prompt_chars": prompt_chars,
+                    "history_chars": int(hm.get("chars") or 0),
+                    "history_budget": int(hm.get("budget") or 0),
+                    "history_stubbed": int(hm.get("stubbed") or 0),
+                    "history_recent_clipped": int(hm.get("recent_clipped") or 0),
+                    "history_overflow": bool(hm.get("overflow")),
+                    "plan_chars": len(getattr(resp, "content", "") or ""),
+                    "parse_ok": parse_ok,
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                }
+            )
             if plan and "kind" in plan:
                 if emit:
                     try:
                         n_steps = len(plan.get("steps", []) or [])
                         if not n_steps and plan.get("step"):
                             n_steps = 1
-                        await emit({
-                            "type": "brain_plan",
-                            "kind": plan.get("kind"),
-                            "steps": n_steps,
-                            "provider": resp.provider,
-                            "model": resp.model,
-                            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
-                        })
+                        await emit(
+                            {
+                                "type": "brain_plan",
+                                "kind": plan.get("kind"),
+                                "steps": n_steps,
+                                "provider": resp.provider,
+                                "model": resp.model,
+                                "elapsed_ms": round(
+                                    (time.perf_counter() - t0) * 1000, 1
+                                ),
+                            }
+                        )
                     except Exception:
                         pass
                 return plan
-            snippet = resp.content[:200].replace("\n", " ") if getattr(resp, "content", None) else "<empty>"
+            snippet = (
+                resp.content[:200].replace("\n", " ")
+                if getattr(resp, "content", None)
+                else "<empty>"
+            )
             log.warning(
                 f"Plan parse failed (attempt {attempt + 1}); retrying. "
                 f"finish_reason={getattr(resp, 'finish_reason', '')!r} "
@@ -1735,17 +2270,26 @@ class AgentBrain:
             # providers reject it; only quote a real (malformed) reply.
             if getattr(resp, "content", ""):
                 retry_messages.append(
-                    {"role": "assistant", "content": resp.content[:500]})
+                    {"role": "assistant", "content": resp.content[:500]}
+                )
             retry_messages.append(
-                {"role": "user",
-                 "content": "That was not valid JSON per the schema. Output ONLY the JSON object."})
+                {
+                    "role": "user",
+                    "content": "That was not valid JSON per the schema. Output ONLY the JSON object.",
+                }
+            )
             messages = retry_messages
         # Last resort: surface as an unusable response, not a successful wrap-up.
-        return {"kind": "chat", "_parse_failed": True,
-                "response": "I couldn't plan that. Try rephrasing."}
+        return {
+            "kind": "chat",
+            "_parse_failed": True,
+            "response": "I couldn't plan that. Try rephrasing.",
+        }
 
     # ------------------------------------------------------------------ step execution
-    async def _run_step(self, skill: str, args: dict, why: str = "", ctx: Any = None) -> BrainStepResult:
+    async def _run_step(
+        self, skill: str, args: dict, why: str = "", ctx: Any = None
+    ) -> BrainStepResult:
         """Execute one step and stream tool.started/tool.result to the UI.
 
         The event wrapper lives here (not in each branch of the implementation)
@@ -1784,7 +2328,9 @@ class AgentBrain:
             pass
         return result
 
-    async def _run_step_inner(self, skill: str, args: dict, why: str = "", ctx: Any = None) -> BrainStepResult:
+    async def _run_step_inner(
+        self, skill: str, args: dict, why: str = "", ctx: Any = None
+    ) -> BrainStepResult:
         t0 = time.perf_counter()
 
         def _ms() -> float:
@@ -1795,16 +2341,24 @@ class AgentBrain:
             allowed = getattr(self, "allowed_skills", None)
             if allowed is not None and not allowed(skill):
                 return BrainStepResult(
-                    skill, args, False,
+                    skill,
+                    args,
+                    False,
                     f"Skill '{skill}' is not available to this subagent.",
-                    why, _ms(),
+                    why,
+                    _ms(),
                 )
-            if skill == "delegate_task" and not getattr(self, "subagents_allowed", False):
+            if skill == "delegate_task" and not getattr(
+                self, "subagents_allowed", False
+            ):
                 return BrainStepResult(
-                    skill, args, False,
+                    skill,
+                    args,
+                    False,
                     "Subagents are disabled or explicit-only for this turn; do "
                     "the work in the main loop.",
-                    why, _ms(),
+                    why,
+                    _ms(),
                 )
             meta = self.skill_registry.get(skill)
             if meta is not None and getattr(meta, "kind", "tool") == "playbook":
@@ -1813,81 +2367,133 @@ class AgentBrain:
                 # acknowledgement closes the current step without pretending
                 # the user's task is complete.
                 return BrainStepResult(
-                    skill, args, True,
+                    skill,
+                    args,
+                    True,
                     "Playbook loaded. Follow its SKILL DETAIL on the next turn "
                     "and execute the concrete tools it names. This call is not "
                     "task completion.",
-                    why, _ms(),
+                    why,
+                    _ms(),
                 )
             if skill == "remember_fact":
                 fact = str(args.get("fact", "")).strip()
                 if fact:
                     self.store.add_fact(fact)
-                    return BrainStepResult(skill, args, True, f"Remembered: {fact}", why, _ms())
-                return BrainStepResult(skill, args, False, "No fact provided", why, _ms())
+                    return BrainStepResult(
+                        skill, args, True, f"Remembered: {fact}", why, _ms()
+                    )
+                return BrainStepResult(
+                    skill, args, False, "No fact provided", why, _ms()
+                )
 
             if skill == "recall_memory":
                 query = str(args.get("query", "")).strip()
                 hits = self.store.search_episodic(query or "recent", limit=5)
                 if hits:
-                    lines = "\n".join(f"- {h.label} ({_fmt_ts(h.timestamp)})" for h in hits)
+                    lines = "\n".join(
+                        f"- {h.label} ({_fmt_ts(h.timestamp)})" for h in hits
+                    )
                     return BrainStepResult(skill, args, True, lines, why, _ms())
-                return BrainStepResult(skill, args, True, "No matching past activity found.", why, _ms())
+                return BrainStepResult(
+                    skill, args, True, "No matching past activity found.", why, _ms()
+                )
 
             if skill == "build_tool":
                 task = str(args.get("task", args.get("goal", ""))).strip()
                 if not task:
-                    return BrainStepResult(skill, args, False,
-                                           "No task description provided for build_tool.", why, _ms())
+                    return BrainStepResult(
+                        skill,
+                        args,
+                        False,
+                        "No task description provided for build_tool.",
+                        why,
+                        _ms(),
+                    )
                 if self.tool_builder is None:
-                    return BrainStepResult(skill, args, False,
-                                           "Tool building is not available in this session.", why, _ms())
+                    return BrainStepResult(
+                        skill,
+                        args,
+                        False,
+                        "Tool building is not available in this session.",
+                        why,
+                        _ms(),
+                    )
                 out = await self.tool_builder(task, ctx)
                 return BrainStepResult(
-                    skill, args, bool(out.get("success", False)),
-                    str(out.get("output") or "Tool build failed."), why, _ms(),
+                    skill,
+                    args,
+                    bool(out.get("success", False)),
+                    str(out.get("output") or "Tool build failed."),
+                    why,
+                    _ms(),
                 )
 
             if skill == "repair_tool":
                 sname = str(
-                    args.get("skill_name") or args.get("tool_name") or args.get("skill") or ""
+                    args.get("skill_name")
+                    or args.get("tool_name")
+                    or args.get("skill")
+                    or ""
                 ).strip()
                 if not sname:
-                    return BrainStepResult(skill, args, False,
-                                           "repair_tool needs the name of the tool to fix.", why, _ms())
+                    return BrainStepResult(
+                        skill,
+                        args,
+                        False,
+                        "repair_tool needs the name of the tool to fix.",
+                        why,
+                        _ms(),
+                    )
                 failure = str(
-                    args.get("failure") or args.get("error") or args.get("problem") or ""
+                    args.get("failure")
+                    or args.get("error")
+                    or args.get("problem")
+                    or ""
                 ).strip()
                 return await self._repair_tool_step(sname, dict(args), failure, why)
 
             tool = self.registry.get(skill)
             if tool is None:
-                return BrainStepResult(skill, args, False, f"Unknown skill '{skill}'", why)
+                return BrainStepResult(
+                    skill, args, False, f"Unknown skill '{skill}'", why
+                )
 
             try:
                 exec_out = await asyncio.wait_for(
-                    self.executor(skill, args), timeout=STEP_TIMEOUT_S)
+                    self.executor(skill, args), timeout=STEP_TIMEOUT_S
+                )
             except asyncio.TimeoutError:
                 return BrainStepResult(
-                    skill, args, False,
+                    skill,
+                    args,
+                    False,
                     f"Execution timed out after {STEP_TIMEOUT_S:.0f}s.",
-                    why, round((time.perf_counter() - t0) * 1000, 1),
-                    warning=f"This step timed out after {STEP_TIMEOUT_S:.0f}s.")
+                    why,
+                    round((time.perf_counter() - t0) * 1000, 1),
+                    warning=f"This step timed out after {STEP_TIMEOUT_S:.0f}s.",
+                )
             # v3/M3: the permission is a hard stop — no re-plan can bypass it
             if exec_out.get("type") == "permission_required":
                 p = exec_out.get("pending") or {}
                 return BrainStepResult(
-                    skill, args, False,
-                    (f"[permission-required] Needs your approval first: '{skill}' "
-                     f"(tier {p.get('tier', '?')}). Approve it, then say the command again. "
-                     f"confirmation_id={p.get('confirmation_id')}"),
+                    skill,
+                    args,
+                    False,
+                    (
+                        f"[permission-required] Needs your approval first: '{skill}' "
+                        f"(tier {p.get('tier', '?')}). Approve to resume this exact action; completed commands will not be replayed. "
+                        f"confirmation_id={p.get('confirmation_id')}"
+                    ),
                     why,
                     round((time.perf_counter() - t0) * 1000, 1),
                     pending=p,
                 )
             if exec_out.get("type") == "denied":
                 return BrainStepResult(
-                    skill, args, False,
+                    skill,
+                    args,
+                    False,
                     f"[denied] {exec_out.get('output', 'Blocked by policy')}",
                     why,
                     round((time.perf_counter() - t0) * 1000, 1),
@@ -1896,7 +2502,11 @@ class AgentBrain:
             success = bool(annotated.get("success", False))
             output = str(annotated.get("output") or annotated.get("stdout") or "Done")
             return BrainStepResult(
-                skill, args, success, output, why,
+                skill,
+                args,
+                success,
+                output,
+                why,
                 round((time.perf_counter() - t0) * 1000, 1),
                 warning=str(annotated.get("_warning") or ""),
                 url=str(annotated.get("url") or ""),
@@ -1905,14 +2515,22 @@ class AgentBrain:
         except Exception as e:
             log.warning(f"Brain step '{skill}' raised: {e}")
             return BrainStepResult(
-                skill, args, False, f"Execution error: {e}", why,
+                skill,
+                args,
+                False,
+                f"Execution error: {e}",
+                why,
                 round((time.perf_counter() - t0) * 1000, 1),
                 warning=f"This step raised: {e}",
             )
 
     # ------------------------------------------------------------------ self-repair
     async def _repair_tool_step(
-        self, sname: str, args: dict, failure: str, why: str,
+        self,
+        sname: str,
+        args: dict,
+        failure: str,
+        why: str,
     ) -> BrainStepResult:
         """Rewrite a broken tool's PowerShell script via the fixer prompt,
         register the fix in memory, verify with one run, then persist."""
@@ -1924,25 +2542,46 @@ class AgentBrain:
         try:
             tool = self.registry.get(sname)
             if tool is None:
-                return BrainStepResult("repair_tool", args, False,
-                                       f"No tool named '{sname}' to repair — build a new tool instead.",
-                                       why, _ms())
+                return BrainStepResult(
+                    "repair_tool",
+                    args,
+                    False,
+                    f"No tool named '{sname}' to repair — build a new tool instead.",
+                    why,
+                    _ms(),
+                )
             script = getattr(tool, "script", "") or ""
             if not script:
-                return BrainStepResult("repair_tool", args, False,
-                                       f"Tool '{sname}' is implemented in code, not a script — nothing to rewrite.",
-                                       why, _ms())
+                return BrainStepResult(
+                    "repair_tool",
+                    args,
+                    False,
+                    f"Tool '{sname}' is implemented in code, not a script — nothing to rewrite.",
+                    why,
+                    _ms(),
+                )
             if not self.gateway.providers:
-                return BrainStepResult("repair_tool", args, False,
-                                       "No model provider configured for script repair.",
-                                       why, _ms())
+                return BrainStepResult(
+                    "repair_tool",
+                    args,
+                    False,
+                    "No model provider configured for script repair.",
+                    why,
+                    _ms(),
+                )
 
-            args_block = ", ".join(f"{a.name}({a.kind})" for a in tool.args) or "no args"
+            args_block = (
+                ", ".join(f"{a.name}({a.kind})" for a in tool.args) or "no args"
+            )
             user_task = str(args.get("task", "")).strip()
             messages = prompts.build_tool_repair_messages(
-                tool.name, tool.description, script, args_block,
-                failure or user_task or
-                "The tool ran but produced a wrong or empty result.",
+                tool.name,
+                tool.description,
+                script,
+                args_block,
+                failure
+                or user_task
+                or "The tool ran but produced a wrong or empty result.",
             )
             resp = await self.gateway.chat(
                 messages,
@@ -1955,30 +2594,43 @@ class AgentBrain:
             if not new_script:
                 log.warning(f"repair_tool: fixer returned no script for '{sname}'")
                 return BrainStepResult(
-                    "repair_tool", args, False,
+                    "repair_tool",
+                    args,
+                    False,
                     f"Attempted repair produced no new script for '{sname}'.",
-                    why, _ms(),
+                    why,
+                    _ms(),
                 )
             try:
                 validate_script_safety(new_script)
             except PolicyError as e:
-                return BrainStepResult("repair_tool", args, False,
-                                       f"Rejected repaired script by safety policy: {e}",
-                                       why, _ms())
+                return BrainStepResult(
+                    "repair_tool",
+                    args,
+                    False,
+                    f"Rejected repaired script by safety policy: {e}",
+                    why,
+                    _ms(),
+                )
 
             fixed = Tool(
                 name=str(fix.get("tool_name") or tool.name),
                 description=str(fix.get("description") or tool.description),
                 script=new_script,
                 scope=fix.get("scope") or getattr(tool, "scope", None),
-                args=[ArgSpec(
-                    name=a["name"],
-                    kind=a.get("kind", "text"),
-                    instructions=a.get("instructions", ""),
-                    criteria=a.get("criteria", {}),
-                    default=a.get("default"),
-                ) for a in (fix.get("args") or [])] or list(tool.args),
-                examples=[str(e) for e in (fix.get("examples") or [])][:3] or list(tool.examples),
+                args=[
+                    ArgSpec(
+                        name=a["name"],
+                        kind=a.get("kind", "text"),
+                        instructions=a.get("instructions", ""),
+                        criteria=a.get("criteria", {}),
+                        default=a.get("default"),
+                    )
+                    for a in (fix.get("args") or [])
+                ]
+                or list(tool.args),
+                examples=[str(e) for e in (fix.get("examples") or [])][:3]
+                or list(tool.examples),
                 is_learned=True,
             )
 
@@ -1990,24 +2642,44 @@ class AgentBrain:
             extras = {
                 k: (str(v) if isinstance(v, (int, float)) else v)
                 for k, v in args.items()
-                if k in defaults and k not in ("skill_name", "tool_name", "skill",
-                                               "failure", "error", "problem", "task")
+                if k in defaults
+                and k
+                not in (
+                    "skill_name",
+                    "tool_name",
+                    "skill",
+                    "failure",
+                    "error",
+                    "problem",
+                    "task",
+                )
             }
             verify_args = {**defaults, **extras}
             try:
                 exec_out = await asyncio.wait_for(
-                    self.executor(fixed.name, verify_args), timeout=STEP_TIMEOUT_S)
+                    self.executor(fixed.name, verify_args), timeout=STEP_TIMEOUT_S
+                )
             except Exception as e:
                 self.registry.register(tool)
-                return BrainStepResult("repair_tool", args, False,
-                                       f"Repaired '{sname}' errored while verifying: {e}",
-                                       why, _ms())
+                return BrainStepResult(
+                    "repair_tool",
+                    args,
+                    False,
+                    f"Repaired '{sname}' errored while verifying: {e}",
+                    why,
+                    _ms(),
+                )
             if not exec_out.get("success", False):
                 self.registry.register(tool)
                 out_txt = str(exec_out.get("output") or exec_out.get("stderr") or "")
-                return BrainStepResult("repair_tool", args, False,
-                                       f"Repaired '{sname}' still fails: {out_txt[:200]}",
-                                       why, _ms())
+                return BrainStepResult(
+                    "repair_tool",
+                    args,
+                    False,
+                    f"Repaired '{sname}' still fails: {out_txt[:200]}",
+                    why,
+                    _ms(),
+                )
 
             # Persist: learned tools overwrite in place; seed tools get a
             # '<name>_fixed' sibling so the fix survives restarts (learned
@@ -2026,15 +2698,21 @@ class AgentBrain:
 
             out_txt = str(exec_out.get("output") or exec_out.get("stdout") or "Done")
             return BrainStepResult(
-                "repair_tool", args, True,
-                (f"Repaired and verified '{fixed.name}' (saved as '{persisted}'). "
-                 f"Run result: {out_txt[:160]}"),
-                why, _ms(),
+                "repair_tool",
+                args,
+                True,
+                (
+                    f"Repaired and verified '{fixed.name}' (saved as '{persisted}'). "
+                    f"Run result: {out_txt[:160]}"
+                ),
+                why,
+                _ms(),
             )
         except Exception as e:
             log.warning(f"repair_tool failed for '{sname}': {e}")
-            return BrainStepResult("repair_tool", args, False,
-                                   f"Repair error: {e}", why, _ms())
+            return BrainStepResult(
+                "repair_tool", args, False, f"Repair error: {e}", why, _ms()
+            )
 
 
 def _url_parts(url: str) -> tuple[str, str]:
@@ -2092,12 +2770,18 @@ def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
                     "Verify this is the right page before proceeding."
                 )
 
-    if skill in ("browser_navigate", "browser_read_page",
-                 "browser_read_full", "browser_wait"):
-        if (result.get("success")
-                and not str(result.get("title") or "").strip()
-                and not str(result.get("text") or "").strip()
-                and not result.get("links")):
+    if skill in (
+        "browser_navigate",
+        "browser_read_page",
+        "browser_read_full",
+        "browser_wait",
+    ):
+        if (
+            result.get("success")
+            and not str(result.get("title") or "").strip()
+            and not str(result.get("text") or "").strip()
+            and not result.get("links")
+        ):
             warnings.append(
                 "The page returned no title and no text, so it is probably "
                 "still loading. Wait 2 seconds and read it again before "
@@ -2138,8 +2822,10 @@ def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
         warnings.append(f"This step failed: {result['error']}")
     elif result.get("success") is False:
         detail = (
-            result.get("output") or result.get("stderr")
-            or result.get("error") or "unknown failure"
+            result.get("output")
+            or result.get("stderr")
+            or result.get("error")
+            or "unknown failure"
         )
         warnings.append(f"This step failed: {str(detail)[:300]}")
 
@@ -2149,6 +2835,26 @@ def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
             warnings = [existing] + [w for w in warnings if w not in existing]
         result["_warning"] = " ".join(warnings)
     return result
+
+
+def _compose_skill_detail(
+    playbook_detail: str, current_detail: str,
+) -> str:
+    """Combine persistent playbook guidance with this turn's skill schema.
+
+    A playbook is a multi-step workflow: its body must stay visible after the
+    planner starts calling tools, otherwise the next turn only sees the last
+    tool's schema and the workflow instructions disappear mid-task.
+    """
+    parts: list[str] = []
+    if playbook_detail:
+        parts.append(
+            "ACTIVE PLAYBOOK GUIDANCE (persists until this task completes; "
+            "follow it while choosing every action):\n" + playbook_detail
+        )
+    if current_detail and current_detail != playbook_detail:
+        parts.append("CURRENT SKILL DETAIL:\n" + current_detail)
+    return "\n\n".join(parts)
 
 
 def inject_skill_detail(
@@ -2204,8 +2910,10 @@ def _is_fetch_escalation(history: List[BrainStepResult], args: dict) -> bool:
     if not url:
         return False
     priors = [
-        step for step in history
-        if step.success and step.skill == "web_fetch"
+        step
+        for step in history
+        if step.success
+        and step.skill == "web_fetch"
         and _fetch_url_of(step.args) == url
     ]
     if not priors or len(priors) >= 2:
@@ -2221,10 +2929,23 @@ def _is_fetch_escalation(history: List[BrainStepResult], args: dict) -> bool:
     return new_limit > prior_limit
 
 
-_ENUM_ARG_KEYS = frozenset({
-    "action", "mode", "direction", "operation", "op", "type", "kind",
-    "state", "align", "layout", "orientation", "unit", "format",
-})
+_ENUM_ARG_KEYS = frozenset(
+    {
+        "action",
+        "mode",
+        "direction",
+        "operation",
+        "op",
+        "type",
+        "kind",
+        "state",
+        "align",
+        "layout",
+        "orientation",
+        "unit",
+        "format",
+    }
+)
 
 
 def _normalise_arg_value(name: str, value: Any) -> Any:
@@ -2243,7 +2964,8 @@ def _prompt_chars(messages: list) -> int:
         if isinstance(content, list):
             total += sum(
                 len(str(block.get("text", "")))
-                for block in content if isinstance(block, dict)
+                for block in content
+                if isinstance(block, dict)
             )
         else:
             total += len(str(content))
@@ -2255,7 +2977,9 @@ def _args_hash(skill: str, args: dict) -> str:
     try:
         raw = json.dumps(
             {"skill": skill, "args": args or {}},
-            sort_keys=True, ensure_ascii=False, default=str,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
         )
     except Exception:
         raw = str(args)
@@ -2275,7 +2999,9 @@ def _step_signature(skill: str, args: dict) -> tuple:
             for key, value in args.items()
         }
     try:
-        args_key = json.dumps(args or {}, sort_keys=True, ensure_ascii=False, default=str)
+        args_key = json.dumps(
+            args or {}, sort_keys=True, ensure_ascii=False, default=str
+        )
     except Exception:
         args_key = str(args)
     return (skill, args_key)
@@ -2287,8 +3013,11 @@ def _clip_args(args: Any, limit: int = 1200) -> dict:
     for key, value in dict(args or {}).items():
         name = str(key)
         if isinstance(value, str):
-            out[name] = value if len(value) <= limit else (
-                value[:limit] + f"… <{len(value)} chars>")
+            out[name] = (
+                value
+                if len(value) <= limit
+                else (value[:limit] + f"… <{len(value)} chars>")
+            )
         elif isinstance(value, (dict, list)):
             try:
                 blob = json.dumps(value, ensure_ascii=False, default=str)
@@ -2316,11 +3045,14 @@ def _emit_thinking(plan: dict, kind: str) -> None:
             summary = f"Next action: {skill}"
         if not summary:
             return
-        event_bus().emit("thinking.summary", {
-            "kind": kind,
-            "summary": summary[:1000],
-            "skill": skill,
-        })
+        event_bus().emit(
+            "thinking.summary",
+            {
+                "kind": kind,
+                "summary": summary[:1000],
+                "skill": skill,
+            },
+        )
     except Exception:
         pass
 
@@ -2340,6 +3072,53 @@ def _stream_answer(text: str) -> None:
         event_bus().stream_answer(str(text or ""))
     except Exception:
         pass
+
+
+_TRACE_REDACT_KEYS = frozenset(
+    {
+        "content",
+        "body",
+        "script",
+        "spec",
+        "code",
+        "text",
+        "command",
+        "api_key",
+        "token",
+        "password",
+        "secret",
+        "authorization",
+        "cookie",
+    }
+)
+
+
+def _rejected_steps_preview(plan: Any, limit: int = 12) -> List[dict]:
+    """Bounded, secret-free shape of a rejected plan for trace diagnosis."""
+    if not isinstance(plan, dict):
+        return []
+    preview: List[dict] = []
+    for step in _extract_steps(plan)[:limit]:
+        args = step.get("args") if isinstance(step.get("args"), dict) else {}
+        safe: Dict[str, Any] = {}
+        for key, value in list(args.items())[:12]:
+            name = str(key)
+            if name.lower() in _TRACE_REDACT_KEYS:
+                safe[name] = f"<{len(str(value))} chars>"
+            elif isinstance(value, str):
+                safe[name] = (
+                    value if len(value) <= 120 else f"<{len(value)} chars>"
+                )
+            else:
+                try:
+                    text = json.dumps(value, ensure_ascii=False, default=repr)
+                except (TypeError, ValueError):
+                    text = repr(value)
+                safe[name] = (
+                    text if len(text) <= 180 else text[:177] + "..."
+                )
+        preview.append({"skill": step.get("skill"), "args": safe})
+    return preview
 
 
 def _extract_steps(plan: dict) -> List[dict]:
@@ -2369,8 +3148,28 @@ def _ctx_block(ctx: Any) -> str:
     active = d.get("active_title") or d.get("active_app") or "Desktop"
     apps = ", ".join((d.get("running_apps") or [])[:10])
     vol = d.get("volume_level", "?")
-    return f"Frontmost: {active}\nRunning apps: {apps}\nVolume: {vol}"
+    try:
+        from ..files import known_folder_paths
 
+        folders = known_folder_paths()
+    except Exception:
+        folders = {}
+    home = Path.home()
+    folder_lines = []
+    for label in ("Desktop", "Documents", "Downloads", "Pictures", "Videos"):
+        path = folders.get(label.lower()) or str(home / label)
+        folder_lines.append(f"  {label}: {path}")
+    return (
+        f"Frontmost: {active}\nRunning apps: {apps}\nVolume: {vol}\n"
+        "USER FOLDERS (exact paths; use these for deliverables):\n"
+        + "\n".join(folder_lines)
+        + "\nIf the user names no location, save a generated file on the "
+        "Desktop above. Never save it inside the WinBrow app/project folder."
+    )
+
+
+def _fmt_ts(ts: float) -> str:
+    import datetime
 
 def _fmt_ts(ts: float) -> str:
     import datetime

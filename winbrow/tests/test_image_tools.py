@@ -268,11 +268,11 @@ def test_resolve_folder_alias_and_override(monkeypatch, tmp_path):
     from winbrow import files
 
     monkeypatch.delenv("WINBROW_IMAGE_DIR", raising=False)
-    monkeypatch.setattr(files, "_special_folder", lambda key: str(tmp_path / key))
+    monkeypatch.setattr(files, "user_home", lambda: str(tmp_path))
     pictures = resolve_folder("Pictures")
-    assert pictures == tmp_path / "pictures" / "WinBrow Images"
+    assert pictures == tmp_path / "Pictures" / "WinBrow Images"
     downloads = resolve_folder("Downloads")
-    assert downloads == tmp_path / "downloads"
+    assert downloads == tmp_path / "Downloads"
     monkeypatch.setenv("WINBROW_IMAGE_DIR", str(tmp_path / "imgs"))
     assert resolve_folder("Pictures") == tmp_path / "imgs"
     explicit = tmp_path / "custom"

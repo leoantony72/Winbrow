@@ -31,6 +31,11 @@ class ArgSpec:
     instructions: str
     criteria: dict[str, str] = field(default_factory=dict)
     default: Optional[str] = None
+    # Explicit optionality for tools whose schema knows it (MCP inputSchema).
+    # None keeps the legacy rule: an argument is required when no default
+    # exists. An explicit False lets a planner omit an optional argument that
+    # the remote server fills in itself.
+    required: Optional[bool] = None
 
 
 @dataclass
@@ -123,6 +128,7 @@ class ToolRegistry:
                         instructions=a.get("instructions", ""),
                         criteria=a.get("criteria", {}),
                         default=a.get("default"),
+                        required=a.get("required"),
                     )
                     for a in item.get("args", [])
                 ]
@@ -166,6 +172,7 @@ class ToolRegistry:
                         instructions=a.get("instructions", ""),
                         criteria=a.get("criteria", {}),
                         default=a.get("default"),
+                        required=a.get("required"),
                     )
                     for a in item.get("args", [])
                 ]
@@ -230,6 +237,7 @@ class ToolRegistry:
                     "instructions": a.instructions,
                     "criteria": a.criteria,
                     "default": a.default,
+                    "required": a.required,
                 }
                 for a in tool.args
             ],

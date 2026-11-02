@@ -1,28 +1,15 @@
 ---
-name: "set-desktop-wallpaper-from-web"
-skill: "set_desktop_wallpaper_from_web"
-args:
-  - name: "search_query"
-    type: "string"
-    required: true
-    default: null
-    description: "Theme or keyword describing the desired wallpaper (e.g. an anime, character, colour scheme or mood)."
-  - name: "resolution"
-    type: "string"
-    required: false
-    default: null
-    description: "Preferred image resolution such as '1920x1080' or '4K'. If omitted, pick the highest available desktop resolution."
-  - name: "wallpaper_site"
-    type: "string"
-    required: false
-    default: null
-    description: "Optional preferred wallpaper website to source from. If omitted, use a general wallpaper site that offers free full-resolution downloads."
+name: set-desktop-wallpaper-from-web
+skill: playbook_set_desktop_wallpaper_from_web
+kind: playbook
+category: creative-media
+args: []
 description: >
-  Find a wallpaper matching a theme on a wallpaper website, download the full-
-  resolution image, and set it as the desktop background. Use when the user
-  wants a new desktop wallpaper sourced from the web by topic. Do not use when
-  the image already exists locally or when the user only wants to browse
-  wallpapers without applying one.
+  Find a wallpaper matching a theme on a wallpaper website, download the
+  full- resolution image, and set it as the desktop background. Use when
+  the user wants a new desktop wallpaper sourced from the web by topic. Do
+  not use when the image already exists locally or when the user only
+  wants to browse wallpapers without applying one.
 ---
 
 ## When to Use

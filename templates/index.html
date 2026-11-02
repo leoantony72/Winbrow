@@ -1055,6 +1055,55 @@
         .int-dep code { background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
         .int-oauth { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
+        /* Browser password import */
+        .cred-card { max-width: 920px; margin: 0 2px 18px; }
+        .cred-import {
+            display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+            border: 1px dashed var(--line); border-radius: 8px; padding: 10px;
+            background: var(--soft);
+        }
+        .cred-import input[type="file"] {
+            font-family: var(--mono); font-size: 11px; color: var(--ink2);
+            max-width: 340px;
+        }
+        .cred-import select {
+            font-family: var(--mono); font-size: 11px; border: 1px solid var(--line);
+            border-radius: 6px; padding: 6px 8px; background: var(--paper); color: var(--ink);
+        }
+        .cred-preview {
+            border: 1px solid var(--line); border-radius: 8px; margin-top: 10px;
+            overflow: hidden;
+        }
+        .cred-preview-head {
+            display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+            padding: 8px 10px; background: var(--soft);
+            border-bottom: 1px solid var(--line);
+            font-family: var(--mono); font-size: 10.5px; color: var(--ink3);
+        }
+        .cred-preview-head strong { color: var(--ink); font-family: var(--sans); }
+        .cred-preview-list { max-height: 260px; overflow: auto; }
+        .cred-row {
+            display: grid; grid-template-columns: 22px minmax(0, 1.4fr) minmax(0, 1fr);
+            gap: 8px; align-items: center; padding: 7px 10px;
+            border-bottom: 1px solid var(--line-soft);
+            font-family: var(--mono); font-size: 11px;
+        }
+        .cred-row:last-child { border-bottom: 0; }
+        .cred-row input { accent-color: var(--accent); }
+        .cred-origin { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .cred-user { color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .cred-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 9px 10px; background: var(--soft); }
+        .cred-saved { display: flex; flex-direction: column; gap: 0; border: 1px solid var(--line); border-radius: 8px; margin-top: 12px; overflow: hidden; }
+        .cred-saved-row {
+            display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) auto;
+            gap: 8px; align-items: center; padding: 8px 10px;
+            border-bottom: 1px solid var(--line-soft);
+            font-family: var(--mono); font-size: 11px;
+        }
+        .cred-saved-row:last-child { border-bottom: 0; }
+        .cred-empty { color: var(--ink3); font-size: 11.5px; padding: 8px 2px; }
+        .cred-warning { color: var(--warn); font-size: 11px; line-height: 1.4; }
+
         /* Subagents panel */
         .sa-grid {
             display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -1109,6 +1158,8 @@
                 <button class="link-btn" id="toolsBtn">Tools</button>
                 <span class="sep">·</span>
                 <button class="link-btn" id="integrationsBtn">Integrations</button>
+                <span class="sep">·</span>
+                <button class="link-btn" id="passwordsBtn">Passwords</button>
                 <span class="sep">·</span>
                 <button class="link-btn" id="subagentsBtn">Subagents</button>
                 <span class="sep">·</span>
@@ -1246,6 +1297,23 @@
         </div>
         <div class="tools-body" id="integrationsBody">
             <div class="empty">Loading integrations…</div>
+        </div>
+    </div>
+</div>
+
+<div class="modal-bg" id="browserCredsModal">
+    <div class="tools-panel">
+        <div class="tools-head">
+            <h2>Browser passwords</h2>
+            <button class="link-btn" onclick="closeBrowserCreds()">Close</button>
+        </div>
+        <div class="sub" style="padding:0 2px 10px;color:var(--ink2);font-size:12px;">
+            Export from Brave or Chrome’s own password manager, then choose that CSV here.
+            Only the logins you select are encrypted locally with Windows DPAPI. Passwords are
+            never shown again or returned by the API.
+        </div>
+        <div class="tools-body" id="browserCredsBody">
+            <div class="empty">Loading browser credentials…</div>
         </div>
     </div>
 </div>
@@ -2085,6 +2153,188 @@ function copyInstallCommand() {
     );
 }
 
+/* ── Browser password import ── */
+let browserCredsCache = [];
+let browserCredsPreview = null;
+
+async function openBrowserCreds() {
+    document.getElementById('browserCredsModal').classList.add('open');
+    document.getElementById('browserCredsBody').innerHTML =
+        '<div class="empty">Loading browser credentials…</div>';
+    try {
+        const resp = await fetch('/api/browser-credentials');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        browserCredsCache = data.credentials || [];
+        renderBrowserCreds();
+    } catch (e) {
+        document.getElementById('browserCredsBody').innerHTML =
+            '<div class="empty">Could not load browser credentials: ' + escHtml(String(e)) + '</div>';
+    }
+}
+
+function closeBrowserCreds() {
+    if (browserCredsPreview && browserCredsPreview.import_id) {
+        fetch('/api/browser-credentials/import/cancel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ import_id: browserCredsPreview.import_id, ids: [] }),
+        }).catch(() => {});
+    }
+    browserCredsPreview = null;
+    document.getElementById('browserCredsModal').classList.remove('open');
+}
+
+function _credError(data) {
+    if (data && typeof data.error === 'string') return data.error;
+    if (data && typeof data.detail === 'string') return data.detail;
+    return 'Request failed';
+}
+
+function renderBrowserCreds() {
+    let html = '<div class="int-card cred-card">' +
+        '<div class="int-card-head"><div><div class="int-title">Import from your browser</div>' +
+        '<div class="int-cat">User-exported CSV · local DPAPI vault</div></div>' +
+        '<span class="int-status ok">Never leaves this PC</span></div>' +
+        '<div class="int-desc">Open the browser’s own password manager, export the logins to a CSV, ' +
+        'and choose that file below. This app does not open or read a browser profile. ' +
+        'Only the rows you check are encrypted and stored.</div>' +
+        '<div class="cred-import">' +
+        '<select id="browserCredsSource" aria-label="Browser source">' +
+        '<option value="brave">Brave</option>' +
+        '<option value="chrome">Chrome</option>' +
+        '<option value="edge">Edge</option>' +
+        '<option value="browser">Other Chromium browser</option>' +
+        '</select>' +
+        '<input type="file" id="browserCredsFile" accept=".csv,text/csv" />' +
+        '<button class="btn-save" style="padding:6px 11px;font-size:11px" onclick="previewBrowserCreds()">Preview CSV</button>' +
+        '</div>' +
+        '<div class="cred-warning">The CSV itself contains plaintext passwords. Delete it after importing, ' +
+        'and keep it out of shared folders.</div>';
+
+    if (browserCredsPreview) html += _renderBrowserCredsPreview();
+    html += _renderSavedBrowserCreds();
+    html += '</div>';
+    document.getElementById('browserCredsBody').innerHTML = html;
+}
+
+function _renderBrowserCredsPreview() {
+    const entries = browserCredsPreview.entries || [];
+    let rows = '';
+    for (const entry of entries) {
+        rows += '<label class="cred-row">' +
+            '<input type="checkbox" class="cred-check" value="' + escHtml(entry.id) + '" />' +
+            '<span class="cred-origin" title="' + escHtml(entry.origin) + '">' + escHtml(entry.origin) + '</span>' +
+            '<span class="cred-user" title="' + escHtml(entry.username) + '">' + escHtml(entry.username) +
+            (entry.name ? ' · ' + escHtml(entry.name) : '') + '</span>' +
+            '</label>';
+    }
+    const skipped = browserCredsPreview.skipped || 0;
+    return '<div class="cred-preview">' +
+        '<div class="cred-preview-head"><strong>' + entries.length + ' login(s) found</strong>' +
+        '<span>Check only the logins to import.' +
+        (skipped ? ' ' + skipped + ' row(s) skipped (no username/password or non-http URL).' : '') +
+        '</span>' +
+        '<button class="link-btn" onclick="toggleBrowserCreds(true)">Select all</button>' +
+        '<button class="link-btn" onclick="toggleBrowserCreds(false)">Clear</button></div>' +
+        '<div class="cred-preview-list">' + rows + '</div>' +
+        '<div class="cred-actions">' +
+        '<button class="btn-save" style="padding:6px 11px;font-size:11px" onclick="commitBrowserCreds()">Import selected</button>' +
+        '<button class="link-btn" onclick="cancelBrowserCredsPreview()">Cancel</button>' +
+        '</div></div>';
+}
+
+function _renderSavedBrowserCreds() {
+    if (!browserCredsCache.length) {
+        return '<div class="cred-empty">No browser logins imported yet.</div>';
+    }
+    let rows = '';
+    for (const cred of browserCredsCache) {
+        rows += '<div class="cred-saved-row">' +
+            '<span class="cred-origin" title="' + escHtml(cred.origin) + '">' + escHtml(cred.origin) + '</span>' +
+            '<span class="cred-user">' + escHtml(cred.username) +
+            (cred.name ? ' · ' + escHtml(cred.name) : '') + '</span>' +
+            '<button class="link-btn" onclick="removeBrowserCred(\'' + escHtml(cred.id) + '\')">Remove</button>' +
+            '</div>';
+    }
+    return '<div class="cred-preview-head" style="border:1px solid var(--line);border-radius:8px 8px 0 0;margin-top:12px">' +
+        '<strong>' + browserCredsCache.length + ' saved login(s)</strong>' +
+        '<span>Passwords are masked and never displayed.</span>' +
+        '<button class="link-btn" onclick="removeAllBrowserCreds()">Remove all</button></div>' +
+        '<div class="cred-saved" style="border-radius:0 0 8px 8px;margin-top:0">' + rows + '</div>';
+}
+
+async function previewBrowserCreds() {
+    const input = document.getElementById('browserCredsFile');
+    const file = input && input.files && input.files[0];
+    if (!file) { showToast('Choose the CSV exported from your browser first'); return; }
+    if (file.size > 5 * 1024 * 1024) { showToast('CSV is larger than 5 MB'); return; }
+    let text = '';
+    try {
+        text = await file.text();
+    } catch (e) {
+        showToast('Could not read the selected file');
+        return;
+    }
+    const source = (document.getElementById('browserCredsSource') || {}).value || 'browser';
+    const resp = await fetch('/api/browser-credentials/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ csv: text, source: source }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) { showToast(_credError(data)); return; }
+    browserCredsPreview = data;
+    renderBrowserCreds();
+    showToast('Found ' + data.count + ' login(s); select what to import');
+}
+
+function toggleBrowserCreds(checked) {
+    document.querySelectorAll('.cred-check').forEach(el => { el.checked = !!checked; });
+}
+
+async function commitBrowserCreds() {
+    if (!browserCredsPreview) return;
+    const ids = Array.from(document.querySelectorAll('.cred-check:checked')).map(el => el.value);
+    if (!ids.length) { showToast('Select at least one login'); return; }
+    const resp = await fetch('/api/browser-credentials/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ import_id: browserCredsPreview.import_id, ids: ids }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) { showToast(_credError(data)); return; }
+    browserCredsPreview = null;
+    await openBrowserCreds();
+    showToast(data.imported + ' login(s) imported');
+}
+
+async function cancelBrowserCredsPreview() {
+    if (browserCredsPreview && browserCredsPreview.import_id) {
+        await fetch('/api/browser-credentials/import/cancel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ import_id: browserCredsPreview.import_id, ids: [] }),
+        }).catch(() => {});
+    }
+    browserCredsPreview = null;
+    renderBrowserCreds();
+}
+
+async function removeBrowserCred(id) {
+    if (!confirm('Remove this saved login?')) return;
+    await fetch('/api/browser-credentials/' + encodeURIComponent(id), { method: 'DELETE' });
+    showToast('Login removed');
+    await openBrowserCreds();
+}
+
+async function removeAllBrowserCreds() {
+    if (!confirm('Remove every saved browser login from this app?')) return;
+    await fetch('/api/browser-credentials', { method: 'DELETE' });
+    showToast('All browser logins removed');
+    await openBrowserCreds();
+}
+
 /* ── Subagents panel ── */
 async function openSubagents() {
     document.getElementById('subagentsModal').classList.add('open');
@@ -2156,6 +2406,11 @@ if (location.hash === '#subagents') {
 document.getElementById('integrationsBtn').addEventListener('click', openIntegrations);
 if (location.hash === '#integrations') {
     setTimeout(openIntegrations, 300);
+}
+
+document.getElementById('passwordsBtn').addEventListener('click', openBrowserCreds);
+if (location.hash === '#passwords') {
+    setTimeout(openBrowserCreds, 300);
 }
 
 function setStatus(text, busy) {

@@ -65,3 +65,63 @@ Permanent findings belong in `.agent/knowledge/`; this file is chronological con
 - **Changed files:** winbrow/brain/model_gateway.py, server.py, templates/index.html, .env.example, .env comments, tests/test_nebius_gateway.py, docs.
 - **Verification:** pytest winbrow/tests -> 56 passed; test_brain_m0/test_syntax -> 48 passed; test_scenarios -> 3 passed. No live Nebius request was made (no key).
 - **Limitations:** default model deepseek-ai/DeepSeek-V4-Flash-0731 can be overridden with WINBROW_NEBIUS_MODEL.
+
+## 2026-11-01 - Electron workspace and dynamic island
+
+- **Summary:** Refreshed the responsive dashboard; installed Tailwind/shadcn structure and reusable dynamic-island, Button, Badge primitives. Integrated the island into real state rendering while preserving backend/permission/voice/kill-switch paths. Added accessible history controls, focus repair, offline/busy/IME composer guards, and an isolated showcase.
+- **Changed files:** frontend renderer/components/styles/config/dependencies, regression tests and Electron smoke script, frontend/README.md, architecture section 9, task checkpoint and ledger.
+- **Verification:** `npm test -- --reporter=dot` -> 54 passed; `npm exec tsc -- --noEmit` passed; `npm run build` passed; `npm run test:electron` passed (dashboard/results/Server, 16 island layouts, narrow layout, showcase, no renderer errors); `git diff --check` passed. Screenshots reviewed at `logs/ui-smoke/`. `npm audit --omit=dev --audit-level=moderate` -> zero production vulnerabilities.
+- **Limitations:** No live sidecar/CDP/UIA/voice actions were run. Development-toolchain audit advisories remain; no unrelated major upgrades applied. CSS editor warnings are Tailwind directives plus existing line-clamp compatibility hints.
+
+## 2026-11-01 - Guarded action batching research
+
+- **Summary:** Researched multi-action planning, bounded browser sequences, programmatic orchestration and dependency-aware execution. Created `BRAIN_BATCHING_PLAN.md` with a phased native-checkbox MVP, observation optimization and later approved workflow reuse. Existing `steps[]` execution already supports multiple ordered commands; planner policy restricts mutation batching.
+- **Safety review:** Added fail-closed protection against whole-goal approval replay after partial guarded execution, shared ownership covering existing foreground writers, and backend-enforced reviewed-form eligibility. No arbitrary-code executor, provider migration or parallel UI mutations recommended.
+- **Changed files:** `BRAIN_BATCHING_PLAN.md`, `.agent/knowledge/04-request-data-flow.md`, checkpoint, ledger and this log. Preserved existing UI/source changes.
+- **Verification:** `python -m pytest winbrow/tests/test_parallel_reads.py winbrow/tests/test_loop_recovery.py -q` → 9 passed in 25.66s; local plan JSON/reference/fence/whitespace validation passed; targeted `git diff --check` passed with LF/CRLF warnings.
+- **Limitations:** Research/plan only; no runtime implementation, provider call, live CDP/UIA or speed benchmark. Initial repository-wide status timed out after partial output; subsequent validation was path-scoped.
+
+## 2026-11-01 - General-purpose multi-step scope clarification
+
+- **Summary:** User clarified that checkbox selection was only an example. Revised `BRAIN_BATCHING_PLAN.md` into a general planner/executor feature for any eligible task, with heterogeneous tools, ordered known-input dependencies, independent read parallelism and explicit reasoning/approval barriers. Checkbox state-setting is now an adapter example, not the first-release boundary.
+- **Decisions:** Generic tool execution contracts and multi-domain fixtures come first; exact scoped T2/T3 pause/resume is part of shared executor work rather than deferred workflow reuse. Unknown tool capabilities remain conservative until reviewed. No broad task-category or mixed-tool ban.
+- **Changed files:** Plan, request-data-flow proposal summary, checkpoint, ledger and this log only; no application source or settings changed.
+- **Verification scope:** Targeted registry and document-tool source review; revised plan JSON/reference/fence/whitespace and scope checks plus targeted diff check recorded in checkpoint. Application tests were not rerun for documentation-only edits; prior nine passing tests belong to the original research turn.
+
+## 2026-11-01 - Guarded multi-action batching implementation (Phases 0-2)
+
+- **Summary:** Implemented backend-owned batch contracts, bounded heterogeneous `steps[]`, a sequential guarded executor, shared browser/desktop ownership and exact permission continuation. Unknown/learned/script/MCP tools remain singleton barriers; desktop batches replan as single actions until a window guard exists.
+- **Changed files:** `winbrow/brain/batching.py`, `winbrow/brain/agent_loop.py`, `winbrow/brain/prompt.py`, `winbrow/execution.py`, `winbrow/agent.py`, `winbrow/permissions.py`, `winbrow/browser_task.py`, `winbrow/subagents.py`, `server.py`, `test_brain_m0.py`, `winbrow/tests/test_batch_policy.py`, `test_batch_execution.py`, `test_browser_batch_guard.py`, `test_permission_scopes.py`, `.env.example`, `README.md`, `AGENT.md`, plan/knowledge/memory.
+- **Verification:** `python -m pytest winbrow/tests -q` -> 598 passed, 2 skipped; `test_brain_m0.py` -> 50 passed; focused batch/policy/guard/permission files -> 309 passed. No live provider, CDP/UIA, form submission or benchmark.
+- **Limitations:** A few unrelated root suites fail at HEAD in this workspace when `.env` supplies a live provider (route-tier assertions expect legacy tiers); reproduced without the batching code. Checkbox state, reviewed desktop window guards, result bindings and MCP/API contracts remain Phase 3+ barriers.
+
+## 2026-11-01 - Fix tool preflight defaults and argument aliases
+
+- **Summary:** Fixed false `brain_batch_rejected` errors. Optional enum defaults (`web_search.freshness=""`) were rejected by the new validator; installer app tools also demanded `package` when the planner used `app`/`app_name`/`name`/`query`. Enum matching is now case-insensitive, a declared empty optional default is valid, common recency words are canonicalized (`today` -> `day`, `recent` -> `week`), and installer package aliases are normalized both before preflight and at execution. Unknown enum values still fail closed.
+- **Changed files:** `winbrow/brain/batching.py`, `winbrow/web_tools.py`, `winbrow/installer.py`, `winbrow/tests/test_batch_policy.py`, `winbrow/tests/test_web_tools.py`, `.agent/knowledge/04-request-data-flow.md`.
+- **Verification:** `test_batch_policy.py` + `test_web_tools.py` -> 169 passed, 1 skipped; `test_batch_execution.py` + `test_parallel_reads.py` + `test_permission_scopes.py` -> 118 passed. No full-suite rerun.
+
+## 2026-11-01 - Server activity grouped by prompt (IST)
+
+- **Summary:** Reworked the dashboard **Server activity** page so every prompt is a collapsible dropdown stamped with its start time in IST. Each dropdown lists the prompt's brain plans/reasoning, actions, answers, approvals and completion oldest-to-newest. Live/running prompts and the newest prompt open by default; older prompts stay collapsed. Live activity is merged with persisted task steps without duplicate thinking/answer rows, and server/connection lines are collected in a final **Server & connection** dropdown.
+- **Changed files:** `frontend/src/Server.tsx`, `frontend/src/styles.css`, `frontend/src/test/Dashboard.test.tsx`, `frontend/README.md`.
+- **Scroll fix:** The Server root only had `.activity` (a plain block), so `.connection-scroll` never received a bounded flex height and long open dropdowns were clipped. `.activity` now shares the same flex column/min-height:0 rules as `.connection`; the Electron smoke injects 2400px of content and verifies the scroller can move.
+- **Verification:** `npm.cmd exec tsc -- --noEmit` passed; `npm.cmd run build` passed; `npm.cmd test` -> 55 passed across 3 files, including a new test for IST-stamped prompt dropdowns and oldest-first action order. Electron UI smoke passed, including computed Server flex/overflow checks and a real scroll-height check. Existing Server filter/clear/restart tests still pass.
+
+## 2026-11-01 - Skill/tool architecture compatibility audit
+
+- **Summary:** Audited all 81 SKILL.md files and all 218 live tools against the guarded-batching executor. Fixed four classes of incompatibility: (1) nine advertised tool skills had no executor (eight were skill-writer output); they are now library playbooks, and the writer always emits `kind: playbook` with a `playbook_` key; (2) 29/126 MCP tools were rejected preflight because optional inputSchema args without defaults were treated as required, so `ArgSpec` now carries explicit `required`; (3) `browser_interact` was unusable selector-only because `instruction` was required despite the skill documenting the selector fast path; (4) `create_text_file`/`open_file` now enforce the required arguments their SKILL.md documents. Playbook-in-batch rejection now explains how to load guidance. Playbooks remain intentional singletons.
+- **Changed files:** `winbrow/registry.py`, `winbrow/mcp.py`, `winbrow/browser_tools.py`, `winbrow/brain/batching.py`, `winbrow/brain/skill_registry.py`, `winbrow/brain/skill_writer.py`, `tools/seed.json`, eight SKILL.md conversions under `winbrow/skills/library/`, `winbrow/tests/test_batch_policy.py`, `test_mcp_args.py` (new), `test_skill_writer.py`, `test_converted_skills.py`, README/knowledge.
+- **Verification:** `python -m pytest winbrow/tests -q` -> 618 passed, 2 skipped; skill validator (spec `{"all": true}`) -> 81 skills, 0 errors; all 27 helper scripts compile and emit one JSON object; all 126 MCP tools preflight with only their schema-required args. No live provider/CDP/UIA run.
+
+## 2026-11-01 - Persistent playbook guidance + copyable UI
+
+- **Summary:** Fixed SKILL DETAIL eviction. A playbook body was injected for one planning turn, then replaced by the next tool's schema, so the planner lost the workflow mid-task (seen with `playbook_html_ppt` -> `run_command`). The latest playbook body now persists as `ACTIVE PLAYBOOK GUIDANCE` for the rest of the run and is combined with the current tool schema; permission continuations carry it. Also fixed MCP array/object arguments (`excludePatterns`, `paths`) being rejected as non-scalar by adding a `json` ArgSpec kind. UI: text selection is enabled app-wide for content; copy buttons added to chat user turns, reasoning, step details, the answer, and Server activity (prompt group + individual entries); row toggles ignore an active text selection.
+- **Changed files:** `winbrow/brain/agent_loop.py`, `winbrow/brain/prompt.py`, `winbrow/brain/batching.py`, `winbrow/mcp.py`, `winbrow/tests/test_playbooks.py`, `test_batch_policy.py`, `test_mcp_args.py`, `frontend/src/components/CopyButton.tsx` (new), `Trace.tsx`, `Dashboard.tsx`, `Server.tsx`, `styles.css`, `frontend/src/test/CopyButton.test.tsx` (new).
+- **Verification:** `python -m pytest winbrow/tests -q` -> 621 passed, 2 skipped; `npm.cmd test` -> 57 passed; `npm.cmd exec tsc -- --noEmit` and `npm.cmd run build` pass. No live provider/browser run.
+
+## 2026-11-01 - Any-folder writes (system paths refused)
+
+- **Summary:** Removed the friendly-folder enums that blocked real paths. `download_images.folder`, `create_text_file.folder` and `download_file.folder` now accept Desktop/Downloads/Documents/Pictures/Videos, a relative subfolder under the user profile, or any absolute path (another drive, project folder, UNC share). A new `winbrow/safe_paths.py` refuses Windows, Program Files, ProgramData, Recovery, Boot and similar OS-owned trees; `files.write_named_text_file`, `image_tools.resolve_folder/download_image`, and the `download_file`/`take_screenshot` PowerShell guards enforce it. `create_text_file` also accepts a full path in `filename`. Prompt rules and both skill docs now describe the wider contract.
+- **Changed files:** `winbrow/safe_paths.py` (new), `winbrow/files.py`, `winbrow/image_tools.py`, `tools/seed.json`, `winbrow/brain/prompt.py`, `winbrow/skills/create-text-file/SKILL.md`, `winbrow/skills/download-images/SKILL.md`, `winbrow/tests/test_safe_paths.py` (new), `test_image_tools.py`, `test_m2_adapters.py`, knowledge.
+- **Verification:** `python -m pytest winbrow/tests -q` -> 629 passed, 2 skipped; `TestFileWrites` -> 2 passed; both rendered PowerShell scripts parse with 0 errors; skill validator 81 skills/0 errors. No live download/write to another drive was run.

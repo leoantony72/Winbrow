@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import socket
 import time
 import urllib.error
@@ -1373,6 +1374,160 @@ class BrowserController:
             self._last_page_state = None
             self._last_page_state_url = None
         return state
+
+    async def batch_state(self, selectors: list[str] | None = None) -> dict:
+        """Observe batch identity and target signatures in the remembered agent tab.
+
+        Never creates/activates a tab or uses cached/clipboard state. The document
+        token survives ordinary DOM edits, but changes on a same-URL reload.
+        Signatures deliberately omit mutable input values and checked state.
+        """
+        tab_id = self._agent_tab_id
+        failure = {
+            "success": False,
+            "identity": {"tab_id": tab_id, "url": None, "document_id": None},
+            "targets": {},
+        }
+        if not tab_id:
+            return {**failure, "error": "No remembered agent tab"}
+        if selectors is None:
+            selectors = []
+        if not isinstance(selectors, list) or any(
+            not isinstance(s, str) for s in selectors
+        ):
+            return {**failure, "error": "Selectors must be a list of strings"}
+        selectors = list(dict.fromkeys(selectors))
+        code = (
+            r"""
+        ((selectors, documentToken) => {
+            const key = '__winbrowBatchDocumentId';
+            if (!Object.prototype.hasOwnProperty.call(document, key)) {
+                Object.defineProperty(document, key, {value: documentToken});
+            }
+            const documentId = document[key];
+            if (typeof documentId !== 'string' || !documentId) {
+                throw new Error('Document identity unavailable');
+            }
+            const text = value => (value || '').replace(/\s+/g, ' ').trim();
+            const targets = Object.create(null);
+            for (const selector of selectors) {
+                const nodes = document.querySelectorAll(selector);
+                const el = nodes[0];
+                const signature = {
+                    exists: !!el, count: nodes.length,
+                    tag: '', type: '', id: '', name: '', role: '', href: '', label: '',
+                    disabled: false, connected: false, visible: false
+                };
+                if (el) {
+                    const attr = name => el.getAttribute(name) || '';
+                    const labelledBy = attr('aria-labelledby').split(/\s+/)
+                        .filter(Boolean).map(id => document.getElementById(id))
+                        .filter(Boolean).map(node => node.textContent).join(' ');
+                    const labels = Array.from(el.labels || [])
+                        .map(node => node.textContent).join(' ');
+                    // Control contents may be edited by the batch; only static
+                    // action text is a fallback for an otherwise unlabelled target.
+                    const actionText = el.matches('button,a,summary,[role="button"],[role="link"]')
+                        && !el.isContentEditable ? el.textContent : '';
+                    const style = window.getComputedStyle(el);
+                    Object.assign(signature, {
+                        tag: el.tagName.toLowerCase(),
+                        type: attr('type') || (typeof el.type === 'string' ? el.type : ''),
+                        id: el.id || '', name: attr('name'), role: attr('role'), href: attr('href'),
+                        label: text(labelledBy || attr('aria-label') || labels ||
+                            attr('alt') || attr('title') || attr('placeholder') || actionText),
+                        disabled: el.matches(':disabled') || attr('aria-disabled') === 'true',
+                        connected: el.isConnected,
+                        visible: el.isConnected && style.display !== 'none' &&
+                            style.visibility !== 'hidden' && style.visibility !== 'collapse' &&
+                            style.opacity !== '0' && Array.from(el.getClientRects())
+                                .some(rect => rect.width > 0 && rect.height > 0)
+                    });
+                }
+                targets[selector] = signature;
+            }
+            return {identity: {url: location.href, document_id: documentId}, targets};
+        })
+        """
+            + f"({json.dumps(selectors)}, {json.dumps(secrets.token_hex(16))})"
+        )
+        try:
+            tabs = await self._list_tabs()
+            target = next((t for t in tabs if t.get("id") == tab_id), None)
+            if self._agent_tab_id != tab_id or target is None:
+                raise RuntimeError("Remembered agent tab changed or is no longer open")
+            # execute_js() reselects via _pick_tab() after an await, which can
+            # fall back to a user tab if reset_session() ran in the meantime.
+            async with self._page_conn(target) as conn:
+                if self._agent_tab_id != tab_id:
+                    raise RuntimeError("Remembered agent tab changed during capture")
+                resp = await conn.call(
+                    "Runtime.evaluate",
+                    {"expression": code, "returnByValue": True},
+                    timeout=8,
+                )
+            evaluation = resp.get("result", {})
+            if "error" in resp or "exceptionDetails" in evaluation:
+                raise RuntimeError(
+                    str(resp.get("error") or evaluation["exceptionDetails"])
+                )
+            state = evaluation.get("result", {}).get("value")
+            if not isinstance(state, dict):
+                raise RuntimeError("Batch state unavailable")
+            identity, targets = state.get("identity"), state.get("targets")
+            if (
+                not isinstance(identity, dict)
+                or any(
+                    not isinstance(identity.get(k), str) or not identity[k]
+                    for k in ("url", "document_id")
+                )
+                or not isinstance(targets, dict)
+                or set(targets) != set(selectors)
+            ):
+                raise RuntimeError("Incomplete batch state")
+            fields = {
+                "exists": bool,
+                "count": int,
+                "tag": str,
+                "type": str,
+                "id": str,
+                "name": str,
+                "role": str,
+                "href": str,
+                "label": str,
+                "disabled": bool,
+                "connected": bool,
+                "visible": bool,
+            }
+            for signature in targets.values():
+                if (
+                    not isinstance(signature, dict)
+                    or any(
+                        type(signature.get(k)) is not kind for k, kind in fields.items()
+                    )
+                    or signature["count"] < 0
+                    or signature["exists"] != (signature["count"] > 0)
+                    or (signature["exists"] and not signature["tag"])
+                ):
+                    raise RuntimeError("Incomplete target signature")
+            tabs = await self._list_tabs()
+            if self._agent_tab_id != tab_id or not any(
+                t.get("id") == tab_id for t in tabs
+            ):
+                raise RuntimeError(
+                    "Remembered agent tab changed or closed during capture"
+                )
+            return {
+                "success": True,
+                "identity": {
+                    "tab_id": tab_id,
+                    "url": identity["url"],
+                    "document_id": identity["document_id"],
+                },
+                "targets": targets,
+            }
+        except Exception as exc:
+            return {**failure, "error": str(exc) or type(exc).__name__}
 
     async def screenshot(self, save_path: Optional[str] = None) -> dict[str, Any]:
         """Capture screenshot of the active browser tab via CDP."""
