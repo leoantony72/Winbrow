@@ -64,6 +64,7 @@ llama_cpp/
 data/chroma/
 data/observe/
 data/integrations.json
+data/browser_credentials.json
 data/google_token.json
 data/subagents.json
 data/skill_smoke/
@@ -71,6 +72,10 @@ tools/context_memory.json
 tools/permissions.json
 tools/session_state.json
 tools/mcp_cache.json
+tools/skills.json
+
+# Local whisper.cpp checkout (not a real submodule; never commit the gitlink)
+/whisper_cpp/
 
 # Local scratch dumps
 planner_prompt_*.txt
@@ -92,6 +97,8 @@ frontend/*.tsbuildinfo
 
 # Database
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
 
 # Temporary files

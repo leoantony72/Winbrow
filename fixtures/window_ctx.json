@@ -1,0 +1,34 @@
+{
+  "home": {
+    "active_app": "Browser",
+    "active_title": "Example Dashboard - Browser",
+    "running_apps": ["Browser", "Editor", "notepad", "explorer", "Music"],
+    "volume_level": 40,
+    "is_muted": false,
+    "dark_mode": false
+  },
+  "editor": {
+    "active_app": "Editor",
+    "active_title": "report.py - Editor",
+    "running_apps": ["Editor", "explorer", "notepad"],
+    "volume_level": 55,
+    "is_muted": false,
+    "dark_mode": true
+  },
+  "notepad": {
+    "active_app": "notepad",
+    "active_title": "Untitled - Notepad",
+    "running_apps": ["notepad", "Editor", "explorer"],
+    "volume_level": 55,
+    "is_muted": false,
+    "dark_mode": true
+  },
+  "notepad_saved": {
+    "active_app": "notepad",
+    "active_title": "home.txt - Notepad",
+    "running_apps": ["notepad", "Editor", "explorer"],
+    "volume_level": 55,
+    "is_muted": false,
+    "dark_mode": true
+  }
+}
